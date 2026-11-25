@@ -1,7 +1,7 @@
 import unittest
 
-from wanshape.inspector import inspect_live
 from tests.fakes import FakeBackend
+from wanshape.inspector import inspect_live
 
 QDISC = """qdisc netem 5753: root refcnt 2 limit 1000 delay 150ms 30ms
 qdisc clsact ffff: parent ffff:fff1

@@ -3,11 +3,10 @@ import io
 import unittest
 from unittest import mock
 
+from tests.fakes import FakeBackend
 from wanshape import cli
-from wanshape.profiles import load_profiles
 from wanshape.inspector import LiveState
 from wanshape.target import Target
-from tests.fakes import FakeBackend
 
 
 def target() -> Target:

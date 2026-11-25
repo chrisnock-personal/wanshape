@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install ruff
+      - run: ruff check src tests bin/wanshape
+      - run: python bin/wanshape --help > /dev/null
+
+  unit:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: PYTHONPATH=src python -m unittest discover -s tests -v
+
+  # The integration tests need the kernel's netem/IFB/flower modules and
+  # unprivileged user namespaces, which Ubuntu 24.04 restricts through AppArmor.
+  host-mode:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Kernel modules and user namespaces
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -yq "linux-modules-extra-$(uname -r)" iperf3
+          sudo modprobe -a sch_netem ifb act_mirred cls_flower cls_matchall
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - run: python3 bin/wanshape doctor
+      - run: sh tests/integration/host_mode.sh
+
+  containers:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Kernel modules, user namespaces, rootless Podman with pasta
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -yq "linux-modules-extra-$(uname -r)" podman passt
+          sudo modprobe -a sch_netem ifb act_mirred cls_flower cls_matchall
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          # --duration needs the user's systemd.
+          sudo loginctl enable-linger "$USER"
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" >> "$GITHUB_ENV"
+      - run: podman pull -q docker.io/library/python:3.12-slim
+      - run: sh tests/integration/netns_mode.sh
+
+  vm:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: KVM, QEMU and user namespaces
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo apt-get update -q
+          sudo apt-get install -yq "linux-modules-extra-$(uname -r)" qemu-system-x86
+          sudo modprobe -a sch_netem ifb act_mirred cls_flower cls_matchall
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: CirrOS guest image
+        run: |
+          curl -fsSLO https://download.cirros-cloud.net/0.6.2/cirros-0.6.2-x86_64-disk.img
+          curl -fsSL https://download.cirros-cloud.net/0.6.2/MD5SUMS \
+            | grep " cirros-0.6.2-x86_64-disk.img$" | md5sum -c -
+      - run: WANSHAPE_VM_IMAGE=$PWD/cirros-0.6.2-x86_64-disk.img sh tests/integration/vm_mode.sh

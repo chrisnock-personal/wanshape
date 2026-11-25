@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from wanshape.profiles import Direction, Profile, ProfileError, load_profiles
+from wanshape.profiles import Direction, ProfileError, load_profiles
 
 
 class ProfileTests(unittest.TestCase):

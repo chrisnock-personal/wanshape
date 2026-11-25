@@ -3,35 +3,34 @@
 from __future__ import annotations
 
 import argparse
-import shlex
 import os
+import shlex
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
+from . import timer
 from .backends import get_backend
+from .errors import CommandError, WanshapeError
 from .host import (
     HostBackend,
     build_host_apply,
     build_host_clear,
-    format_ports,
     host_ports_for,
+    inspect_host,
     parse_ports,
     remote_ports_from_container,
-    inspect_host,
     require_root,
     resolve_host_iface,
     run_plan,
 )
-from .errors import CommandError, WanshapeError
 from .inspector import HANDLE, inspect_live, stats
 from .planner import build_apply_plan, build_clear_plan
 from .profiles import Direction, Profile, ProfileError, load_profiles
 from .state import load_state, make_entry, save_state
 from .target import Target, netns_members, resolve
 from .vm import resolve_vm
-from . import timer
 
 EXIT_ERROR = 1
 EXIT_UNSUPPORTED = 2

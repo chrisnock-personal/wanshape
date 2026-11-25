@@ -44,7 +44,6 @@ from .errors import (
     UnsupportedTarget,
     WanshapeError,
 )
-from .inspector import HANDLE
 from .planner import netem_tree
 from .profiles import Profile
 

@@ -44,9 +44,13 @@ class DomiflistTests(unittest.TestCase):
             choose_interface("vm", ifaces)
 
     def test_tap_mac_check(self):
-        ok = lambda args: json.dumps([{"address": "fe:54:00:aa:bb:01"}])
+        def ok(args):
+            return json.dumps([{"address": "fe:54:00:aa:bb:01"}])
+
+        def other(args):
+            return json.dumps([{"address": "fe:54:00:99:99:99"}])
+
         check_tap_mac("vnet3", "52:54:00:aa:bb:01", run=ok)
-        other = lambda args: json.dumps([{"address": "fe:54:00:99:99:99"}])
         with self.assertRaises(WanshapeError):
             check_tap_mac("vnet3", "52:54:00:aa:bb:01", run=other)
         with self.assertRaises(WanshapeError):

@@ -5,14 +5,14 @@ import io
 import unittest
 from unittest import mock
 
+from tests.fakes import FakeBackend
+from tests.test_cli import args
 from wanshape import cli
 from wanshape.errors import CommandError, ConflictError, WanshapeError
-from wanshape.host import HostLive, PortRange, build_host_apply, parse_ports
+from wanshape.host import HostLive, build_host_apply, parse_ports
 from wanshape.inspector import LiveState
 from wanshape.profiles import load_profiles
 from wanshape.target import Target
-from tests.fakes import FakeBackend
-from tests.test_cli import args
 
 
 def target(name, inode):

@@ -3,9 +3,10 @@ import time
 import unittest
 from unittest import mock
 
+from tests import REAL_TIMER
 from wanshape import timer
 from wanshape.errors import PrerequisiteError, WanshapeError
-from tests import REAL_TIMER
+
 
 class DurationTests(unittest.TestCase):
     def test_parse(self):
