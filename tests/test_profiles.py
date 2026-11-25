@@ -94,19 +94,18 @@ class MoreNetemOptionTests(unittest.TestCase):
 
     def test_args_in_tc_order(self):
         d = Direction(delay="50ms", jitter="10ms", delay_correlation="25%",
-                      distribution="normal", loss="2%", loss_correlation="30%",
+                      distribution="normal", loss="2%",
                       reorder="10% 50%", duplicate="1%", corrupt="0.1%", rate="1mbit",
                       slot="5ms 20ms", seed="42", raw="ecn")
         d.validate("t")
         self.assertEqual(" ".join(d.netem_args()),
-                         "delay 50ms 10ms 25% distribution normal loss 2% 30% duplicate 1% "
+                         "delay 50ms 10ms 25% distribution normal loss 2% duplicate 1% "
                          "corrupt 0.1% reorder 10% 50% rate 1mbit slot 5ms 20ms seed 42 "
                          "limit 1000 ecn")
 
     def test_invalid_combinations(self):
         bad = [
             Direction(delay="50ms", delay_correlation="25%"),           # no jitter
-            Direction(delay="50ms", loss_model="gemodel 1%", loss_correlation="5%"),
             Direction(reorder="10%"),                                   # no delay
             Direction(delay="5ms", reorder="10% 50% 3%"),
             Direction(delay="5ms", reorder="150%"),
@@ -119,6 +118,17 @@ class MoreNetemOptionTests(unittest.TestCase):
         for d in bad:
             with self.assertRaises(ProfileError, msg=repr(d)):
                 d.validate("t")
+
+    def test_unknown_and_removed_fields_are_profile_errors(self):
+        from wanshape.profiles import _profile_from
+        with self.assertRaises(ProfileError):
+            _profile_from("x", {"up": {"delay": "5ms", "delya": "5ms"}})
+        with self.assertRaisesRegex(ProfileError, "gemodel"):
+            _profile_from("x", {"up": {"loss": "1%", "loss_correlation": "25%"}})
+        with self.assertRaises(ProfileError):
+            _profile_from("x", {"descripton": "typo"})
+        with self.assertRaises(ProfileError):
+            _profile_from("x", {"up": "5ms"})
 
     def test_profile_file_accepts_new_fields(self):
         with tempfile.TemporaryDirectory() as tmp:

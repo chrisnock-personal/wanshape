@@ -105,6 +105,128 @@ jitter = "15ms"
 distribution = "normal"
 loss_model = "gemodel 1% 25% 100% 0%"
 rate = "512kbit"
+
+[profiles.leo-satellite]
+description = "Low-orbit satellite (Starlink-style)"
+reorder_on_jitter = false
+[profiles.leo-satellite.up]
+delay = "22ms"
+jitter = "8ms"
+distribution = "normal"
+loss_model = "gemodel 0.1% 20% 100% 0%"
+rate = "15mbit"
+[profiles.leo-satellite.down]
+delay = "22ms"
+jitter = "8ms"
+distribution = "normal"
+loss_model = "gemodel 0.1% 20% 100% 0%"
+rate = "100mbit"
+
+[profiles.lte-congested]
+description = "Busy LTE cell: bursty scheduling"
+reorder_on_jitter = false
+[profiles.lte-congested.up]
+delay = "40ms"
+jitter = "20ms"
+distribution = "normal"
+loss_model = "gemodel 0.25% 25% 100% 0%"
+slot = "5ms 15ms"
+rate = "1mbit"
+[profiles.lte-congested.down]
+delay = "40ms"
+jitter = "20ms"
+distribution = "normal"
+loss_model = "gemodel 0.25% 25% 100% 0%"
+slot = "5ms 15ms"
+rate = "5mbit"
+
+[profiles.2g-edge]
+description = "GPRS/EDGE"
+reorder_on_jitter = true
+[profiles.2g-edge.up]
+delay = "200ms"
+jitter = "50ms"
+distribution = "normal"
+loss = "1%"
+rate = "100kbit"
+[profiles.2g-edge.down]
+delay = "200ms"
+jitter = "50ms"
+distribution = "normal"
+loss = "1%"
+rate = "200kbit"
+
+[profiles.dsl]
+description = "ADSL2+ broadband"
+reorder_on_jitter = false
+[profiles.dsl.up]
+delay = "15ms"
+jitter = "2ms"
+distribution = "normal"
+rate = "1mbit"
+[profiles.dsl.down]
+delay = "15ms"
+jitter = "2ms"
+distribution = "normal"
+rate = "16mbit"
+
+[profiles.transatlantic]
+description = "Long-haul but clean (London-New York)"
+reorder_on_jitter = false
+[profiles.transatlantic.up]
+delay = "32ms"
+jitter = "1ms"
+distribution = "normal"
+[profiles.transatlantic.down]
+delay = "32ms"
+jitter = "1ms"
+distribution = "normal"
+
+[profiles.wifi-roaming]
+description = "Wi-Fi while moving between access points"
+reorder_on_jitter = true
+[profiles.wifi-roaming.up]
+delay = "10ms"
+jitter = "10ms"
+delay_correlation = "50%"
+distribution = "pareto"
+loss_model = "gemodel 0.5% 15% 100% 0%"
+rate = "10mbit"
+[profiles.wifi-roaming.down]
+delay = "10ms"
+jitter = "10ms"
+delay_correlation = "50%"
+distribution = "pareto"
+loss_model = "gemodel 0.5% 15% 100% 0%"
+rate = "20mbit"
+
+[profiles.voip-poor]
+description = "VoIP, poor: noticeable but usable"
+reorder_on_jitter = false
+[profiles.voip-poor.up]
+delay = "100ms"
+jitter = "30ms"
+distribution = "normal"
+loss_model = "gemodel 0.5% 25% 100% 0%"
+[profiles.voip-poor.down]
+delay = "100ms"
+jitter = "30ms"
+distribution = "normal"
+loss_model = "gemodel 0.5% 25% 100% 0%"
+
+[profiles.voip-bad]
+description = "VoIP, bad: past the ITU-T G.114 comfort limit"
+reorder_on_jitter = false
+[profiles.voip-bad.up]
+delay = "200ms"
+jitter = "60ms"
+distribution = "normal"
+loss_model = "gemodel 1.5% 25% 100% 0%"
+[profiles.voip-bad.down]
+delay = "200ms"
+jitter = "60ms"
+distribution = "normal"
+loss_model = "gemodel 1.5% 25% 100% 0%"
 """
 
 _TIME = re.compile(r"^\d+(?:\.\d+)?(?:us|ms|s)$")
@@ -125,7 +247,6 @@ class Direction:
     loss_model: str | None = None
     rate: str | None = None
     delay_correlation: str | None = None  # "25%": each delay depends on the last
-    loss_correlation: str | None = None   # "25%": bursty random loss without a model
     reorder: str | None = None            # "25%" or "25% 50%": sent at once, ahead of others
     duplicate: str | None = None          # "1%"
     corrupt: str | None = None            # "0.1%": one flipped bit
@@ -160,15 +281,13 @@ class Direction:
                 raise ProfileError(f"{label}: jitter must be <= delay for normal distribution")
         if (self.jitter or self.distribution) and not self.delay:
             raise ProfileError(f"{label}: jitter/distribution require a delay")
-        for name in ("delay_correlation", "loss_correlation", "duplicate", "corrupt"):
+        for name in ("delay_correlation", "duplicate", "corrupt"):
             value = getattr(self, name)
             if value is not None and not (_PERCENT.match(str(value))
                                           and 0 <= float(str(value)[:-1]) <= 100):
                 raise ProfileError(f"{label}: invalid {name} {value!r} (a percentage)")
         if self.delay_correlation and not self.jitter:
             raise ProfileError(f"{label}: delay_correlation needs jitter")
-        if self.loss_correlation and not self.loss:
-            raise ProfileError(f"{label}: loss_correlation needs random loss (not loss_model)")
         if self.reorder is not None:
             parts = str(self.reorder).split()
             if not 1 <= len(parts) <= 2 or not all(
@@ -201,8 +320,6 @@ class Direction:
             args += ["loss", *self.loss_model.split()]
         elif self.loss:
             args += ["loss", self.loss]
-            if self.loss_correlation:
-                args.append(self.loss_correlation)
         if self.duplicate:
             args += ["duplicate", self.duplicate]
         if self.corrupt:
@@ -241,13 +358,35 @@ def _to_ms(value: str) -> float:
     raise ProfileError(f"invalid time {value!r}")
 
 
+_DIRECTION_FIELDS = set(Direction.__dataclass_fields__)
+_REMOVED = {
+    "loss_correlation": "netem drops almost nothing with simple loss correlation "
+                        "(measured: loss 3% 25% lost 0.03%); use loss_model "
+                        "= \"gemodel P R 100% 0%\" for bursty loss",
+}
+
+
+def _direction_from(label: str, raw: dict) -> Direction:
+    if not isinstance(raw, dict):
+        raise ProfileError(f"{label}: expected a table of settings")
+    for key in raw:
+        if key in _REMOVED:
+            raise ProfileError(f"{label}: {key} is not supported: {_REMOVED[key]}")
+        if key not in _DIRECTION_FIELDS:
+            raise ProfileError(f"{label}: unknown setting {key!r}")
+    return Direction(**{k: str(v) for k, v in raw.items()})
+
+
 def _profile_from(name: str, raw: dict) -> Profile:
+    unknown = set(raw) - {"description", "reorder_on_jitter", "up", "down"}
+    if unknown:
+        raise ProfileError(f"{name}: unknown setting(s) {', '.join(sorted(unknown))}")
     return Profile(
         name=name,
         description=str(raw.get("description", "")),
         reorder_on_jitter=bool(raw.get("reorder_on_jitter", True)),
-        up=Direction(**{k: str(v) for k, v in raw.get("up", {}).items()}),
-        down=Direction(**{k: str(v) for k, v in raw.get("down", {}).items()}),
+        up=_direction_from(f"{name}.up", raw.get("up", {})),
+        down=_direction_from(f"{name}.down", raw.get("down", {})),
     )
 
 

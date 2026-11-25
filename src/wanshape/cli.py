@@ -127,8 +127,6 @@ def _add_profile_args(parser: argparse.ArgumentParser) -> None:
     extra = parser.add_argument_group("more netem options (inline profile)")
     extra.add_argument("--delay-correlation", metavar="PCT",
                        help="how much each delay depends on the last, e.g. 25%%")
-    extra.add_argument("--loss-correlation", metavar="PCT",
-                       help="bursty random loss, e.g. 25%% (with --loss)")
     extra.add_argument("--reorder", metavar="PCT[,CORR]",
                        help="send this share at once, ahead of others, e.g. 25%%,50%%")
     extra.add_argument("--duplicate", metavar="PCT", help="duplicate packets, e.g. 1%%")
@@ -191,7 +189,7 @@ class _Commands:
     @staticmethod
     def list(_args: argparse.Namespace) -> int:
         for name, profile in sorted(load_profiles().items()):
-            print(f"{name:12} {profile.description}")
+            print(f"{name:14} {profile.description}")
         return 0
 
     @staticmethod
@@ -447,7 +445,6 @@ def _profile_from_args(args: argparse.Namespace) -> Profile:
         loss_model=loss_model,
         rate=args.rate,
         delay_correlation=getattr(args, "delay_correlation", None),
-        loss_correlation=getattr(args, "loss_correlation", None),
         reorder=_spaced(getattr(args, "reorder", None)),
         duplicate=getattr(args, "duplicate", None),
         corrupt=getattr(args, "corrupt", None),

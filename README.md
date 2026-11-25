@@ -39,14 +39,7 @@ wanshape list
 wanshape show lossy-sip
 ```
 
-| Profile | One-way delay | Jitter | Loss | Down / up | Reorders |
-|---|---|---|---|---|---|
-| `office` | 5 ms | 1 ms | 0% | 100 / 100 mbit | no |
-| `4g` | 25 ms | 10 ms | 0.1% | 10 / 5 mbit | no |
-| `3g` | 150 ms | 30 ms | 1% | 1600 / 768 kbit | yes |
-| `satellite` | 300 ms | 20 ms | 0.5% | 5 / 1 mbit | no |
-| `bad-wifi` | 40 ms | 60 ms pareto | 5% | 2 / 1 mbit | yes |
-| `lossy-sip` | 50 ms | 15 ms | bursty (Gilbert-Elliott) | 512 / 512 kbit | no |
+Fourteen built-in profiles, from `office` (5 ms each way) and `transatlantic` through `leo-satellite`, `4g`, `lte-congested`, `wifi-roaming`, `dsl`, `3g` and `2g-edge` to GEO `satellite` (300 ms each way), plus graded VoIP conditions: `lossy-sip`, `voip-poor`, `voip-bad` and `bad-wifi`. [docs/PROFILES.md](docs/PROFILES.md) lists each one's settings, the round trip and loss it measured, and where its numbers come from.
 
 **Delay is one-way and applies in each direction**, so `3g` adds about 300 ms to a round trip. "Up" (egress) is traffic from the target; "down" (ingress) is traffic to it. With jitter, netem reorders packets unless the profile says otherwise or you pass `--no-reorder`.
 
@@ -57,7 +50,6 @@ More netem options, as CLI flags (inline settings) or profile fields:
 | Flag | Profile field | What it does |
 |---|---|---|
 | `--delay-correlation 25%` | `delay_correlation` | each delay depends partly on the last, so jitter drifts instead of jumping (needs `--jitter`) |
-| `--loss-correlation 25%` | `loss_correlation` | random loss that comes in bursts, without a full loss model (needs `--loss`) |
 | `--reorder 25%,50%` | `reorder = "25% 50%"` | send this share of packets at once, ahead of the delayed ones (needs `--delay`) |
 | `--duplicate 1%` | `duplicate` | send some packets twice |
 | `--corrupt 0.1%` | `corrupt` | flip one bit in some packets |
