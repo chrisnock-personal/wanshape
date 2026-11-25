@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -123,6 +124,14 @@ class Direction:
     loss: str | None = None
     loss_model: str | None = None
     rate: str | None = None
+    delay_correlation: str | None = None  # "25%": each delay depends on the last
+    loss_correlation: str | None = None   # "25%": bursty random loss without a model
+    reorder: str | None = None            # "25%" or "25% 50%": sent at once, ahead of others
+    duplicate: str | None = None          # "1%"
+    corrupt: str | None = None            # "0.1%": one flipped bit
+    slot: str | None = None               # "10ms 30ms": released in bursts (Wi-Fi, LTE)
+    seed: str | None = None               # fixed random seed for repeatable runs
+    raw: str | None = None                # further netem arguments, appended as given
 
     def validate(self, label: str) -> None:
         if self.loss and self.loss_model:
@@ -151,6 +160,31 @@ class Direction:
                 raise ProfileError(f"{label}: jitter must be <= delay for normal distribution")
         if (self.jitter or self.distribution) and not self.delay:
             raise ProfileError(f"{label}: jitter/distribution require a delay")
+        for name in ("delay_correlation", "loss_correlation", "duplicate", "corrupt"):
+            value = getattr(self, name)
+            if value is not None and not (_PERCENT.match(str(value))
+                                          and 0 <= float(str(value)[:-1]) <= 100):
+                raise ProfileError(f"{label}: invalid {name} {value!r} (a percentage)")
+        if self.delay_correlation and not self.jitter:
+            raise ProfileError(f"{label}: delay_correlation needs jitter")
+        if self.loss_correlation and not self.loss:
+            raise ProfileError(f"{label}: loss_correlation needs random loss (not loss_model)")
+        if self.reorder is not None:
+            parts = str(self.reorder).split()
+            if not 1 <= len(parts) <= 2 or not all(
+                    _PERCENT.match(x) and float(x[:-1]) <= 100 for x in parts):
+                raise ProfileError(f"{label}: invalid reorder {self.reorder!r} (e.g. 25% 50%)")
+            if not self.delay:
+                raise ProfileError(f"{label}: reorder needs a delay (netem sends the "
+                                   "reordered packets at once and delays the rest)")
+        if self.slot is not None:
+            parts = str(self.slot).split()
+            if not 1 <= len(parts) <= 2 or not all(_TIME.match(x) for x in parts):
+                raise ProfileError(f"{label}: invalid slot {self.slot!r} (e.g. 10ms 30ms)")
+        if self.seed is not None and not str(self.seed).isdigit():
+            raise ProfileError(f"{label}: seed must be a whole number")
+        if self.raw is not None and not str(self.raw).strip():
+            raise ProfileError(f"{label}: raw is empty")
 
     def netem_args(self) -> list[str]:
         args: list[str] = []
@@ -158,6 +192,8 @@ class Direction:
             args += ["delay", self.delay]
             if self.jitter:
                 args.append(self.jitter)
+                if self.delay_correlation:
+                    args.append(self.delay_correlation)
             if self.distribution:
                 args += ["distribution", self.distribution]
         if self.loss_model:
@@ -165,9 +201,23 @@ class Direction:
             args += ["loss", *self.loss_model.split()]
         elif self.loss:
             args += ["loss", self.loss]
+            if self.loss_correlation:
+                args.append(self.loss_correlation)
+        if self.duplicate:
+            args += ["duplicate", self.duplicate]
+        if self.corrupt:
+            args += ["corrupt", self.corrupt]
+        if self.reorder:
+            args += ["reorder", *str(self.reorder).split()]
         if self.rate:
             args += ["rate", self.rate]
+        if self.slot:
+            args += ["slot", *str(self.slot).split()]
+        if self.seed:
+            args += ["seed", str(self.seed)]
         args += ["limit", "1000"]
+        if self.raw:
+            args += shlex.split(str(self.raw))
         return args
 
 

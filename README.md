@@ -52,6 +52,19 @@ wanshape show lossy-sip
 
 Instead of a profile, give the settings inline: `--delay 150ms [--jitter 30ms] [--distribution normal] [--loss 1% | --loss-model gemodel:1%,25%,100%,0%] [--rate 768kbit]`. Inline settings apply to both directions.
 
+More netem options, as CLI flags (inline settings) or profile fields:
+
+| Flag | Profile field | What it does |
+|---|---|---|
+| `--delay-correlation 25%` | `delay_correlation` | each delay depends partly on the last, so jitter drifts instead of jumping (needs `--jitter`) |
+| `--loss-correlation 25%` | `loss_correlation` | random loss that comes in bursts, without a full loss model (needs `--loss`) |
+| `--reorder 25%,50%` | `reorder = "25% 50%"` | send this share of packets at once, ahead of the delayed ones (needs `--delay`) |
+| `--duplicate 1%` | `duplicate` | send some packets twice |
+| `--corrupt 0.1%` | `corrupt` | flip one bit in some packets |
+| `--slot 10ms,30ms` | `slot = "10ms 30ms"` | hold packets and release them in bursts, as Wi-Fi and LTE schedulers do |
+| `--seed 42` | `seed` | fixed random seed, for runs you can repeat |
+| `--raw-netem "ecn"` | `raw` | any other netem arguments, appended as given |
+
 Your own profiles go in `~/.config/wanshape/profiles.toml` and are added to the built-ins (or override them):
 
 ```toml

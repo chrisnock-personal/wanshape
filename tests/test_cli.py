@@ -83,6 +83,17 @@ class CliApplyTests(unittest.TestCase):
         self.assertEqual(self.state, {})
 
 
+class CliNetemOptionTests(unittest.TestCase):
+    def test_comma_lists_become_tc_spacing(self):
+        a = args(jitter="5ms", reorder="10%,50%", slot="5ms,20ms", duplicate="1%",
+                 seed="7", raw_netem="ecn")
+        netem = " ".join(cli._profile_from_args(a).up.netem_args())
+        self.assertIn("reorder 10% 50%", netem)
+        self.assertIn("slot 5ms 20ms", netem)
+        self.assertIn("seed 7", netem)
+        self.assertTrue(netem.endswith("ecn"))
+
+
 class CliLossModelTests(unittest.TestCase):
     def test_cli_loss_model_syntax(self):
         profile = cli._profile_from_args(args(loss_model="gemodel:1%,25%,100%,0%"))

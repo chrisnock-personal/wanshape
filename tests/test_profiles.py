@@ -89,5 +89,56 @@ class TimeUnitTests(unittest.TestCase):
         Direction(delay="1s", jitter="200ms", distribution="normal").validate("t")
 
 
+class MoreNetemOptionTests(unittest.TestCase):
+    """#10: correlation, reorder, duplicate, corrupt, slot, seed, raw."""
+
+    def test_args_in_tc_order(self):
+        d = Direction(delay="50ms", jitter="10ms", delay_correlation="25%",
+                      distribution="normal", loss="2%", loss_correlation="30%",
+                      reorder="10% 50%", duplicate="1%", corrupt="0.1%", rate="1mbit",
+                      slot="5ms 20ms", seed="42", raw="ecn")
+        d.validate("t")
+        self.assertEqual(" ".join(d.netem_args()),
+                         "delay 50ms 10ms 25% distribution normal loss 2% 30% duplicate 1% "
+                         "corrupt 0.1% reorder 10% 50% rate 1mbit slot 5ms 20ms seed 42 "
+                         "limit 1000 ecn")
+
+    def test_invalid_combinations(self):
+        bad = [
+            Direction(delay="50ms", delay_correlation="25%"),           # no jitter
+            Direction(delay="50ms", loss_model="gemodel 1%", loss_correlation="5%"),
+            Direction(reorder="10%"),                                   # no delay
+            Direction(delay="5ms", reorder="10% 50% 3%"),
+            Direction(delay="5ms", reorder="150%"),
+            Direction(duplicate="1"),
+            Direction(corrupt="101%"),
+            Direction(slot="fast"),
+            Direction(seed="-1"),
+            Direction(raw="  "),
+        ]
+        for d in bad:
+            with self.assertRaises(ProfileError, msg=repr(d)):
+                d.validate("t")
+
+    def test_profile_file_accepts_new_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "wanshape"
+            path.mkdir()
+            (path / "profiles.toml").write_text(
+                '[profiles.lte-busy.up]\ndelay = "30ms"\nslot = "5ms 15ms"\n'
+                '[profiles.lte-busy.down]\ndelay = "30ms"\nreorder = "5%"\n')
+            old = os.environ.get("XDG_CONFIG_HOME")
+            os.environ["XDG_CONFIG_HOME"] = tmp
+            try:
+                p = load_profiles()["lte-busy"]
+            finally:
+                if old is None:
+                    os.environ.pop("XDG_CONFIG_HOME", None)
+                else:
+                    os.environ["XDG_CONFIG_HOME"] = old
+        self.assertIn("slot", p.up.netem_args())
+        self.assertIn("reorder", p.down.netem_args())
+
+
 if __name__ == "__main__":
     unittest.main()

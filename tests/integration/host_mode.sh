@@ -115,4 +115,20 @@ expect "all cleared" udp 42000 0 5
 tc qdisc show dev h0 | grep -q clsact && fail "clsact left behind"
 ip link show type ifb | grep -q wsh && fail "IFB left behind"
 echo "ok   nothing left behind"
+# More netem options (#10): every packet duplicated means two echoes per probe.
+ws apply-host dup --ports 43000 --iface h0 --delay 1ms --duplicate 100% --direction egress \
+    --raw-netem "seed 1" > /dev/null
+got=$(python3 -c '
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("10.9.0.1", 43000)); s.settimeout(0.5)
+s.sendto(b"x", ("10.9.0.2", 9999)); n = 0
+try:
+    while True:
+        s.recv(10); n += 1
+except TimeoutError:
+    pass
+print(n)')
+[ "$got" -eq 2 ] || fail "duplicate 100%: got $got echoes, expected 2"
+ws clear-host dup > /dev/null
+echo "ok   --duplicate 100% doubles the packets"
 echo "PASS"

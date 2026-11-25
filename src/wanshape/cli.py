@@ -124,6 +124,20 @@ def _add_profile_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--loss", help="random loss percentage, e.g. 1%%")
     parser.add_argument("--loss-model", help="bursty loss, e.g. gemodel:1%%,25%%,100%%,0%%")
     parser.add_argument("--rate", help="bandwidth cap, e.g. 768kbit")
+    extra = parser.add_argument_group("more netem options (inline profile)")
+    extra.add_argument("--delay-correlation", metavar="PCT",
+                       help="how much each delay depends on the last, e.g. 25%%")
+    extra.add_argument("--loss-correlation", metavar="PCT",
+                       help="bursty random loss, e.g. 25%% (with --loss)")
+    extra.add_argument("--reorder", metavar="PCT[,CORR]",
+                       help="send this share at once, ahead of others, e.g. 25%%,50%%")
+    extra.add_argument("--duplicate", metavar="PCT", help="duplicate packets, e.g. 1%%")
+    extra.add_argument("--corrupt", metavar="PCT", help="flip a bit in packets, e.g. 0.1%%")
+    extra.add_argument("--slot", metavar="MIN[,MAX]",
+                       help="release packets in bursts, e.g. 10ms,30ms (Wi-Fi, LTE)")
+    extra.add_argument("--seed", help="fixed random seed, for repeatable runs")
+    extra.add_argument("--raw-netem", metavar="ARGS",
+                       help="further netem arguments, appended as given, e.g. \"ecn\"")
     parser.add_argument("--direction", choices=("egress", "ingress", "both"), default="both",
                         help="egress = upload from the target, ingress = download")
     parser.add_argument("--no-reorder", action="store_true",
@@ -432,6 +446,14 @@ def _profile_from_args(args: argparse.Namespace) -> Profile:
         loss=args.loss,
         loss_model=loss_model,
         rate=args.rate,
+        delay_correlation=getattr(args, "delay_correlation", None),
+        loss_correlation=getattr(args, "loss_correlation", None),
+        reorder=_spaced(getattr(args, "reorder", None)),
+        duplicate=getattr(args, "duplicate", None),
+        corrupt=getattr(args, "corrupt", None),
+        slot=_spaced(getattr(args, "slot", None)),
+        seed=getattr(args, "seed", None),
+        raw=getattr(args, "raw_netem", None),
     )
     profile = Profile(
         name="inline",
@@ -442,6 +464,11 @@ def _profile_from_args(args: argparse.Namespace) -> Profile:
     )
     profile.validate()
     return profile
+
+
+def _spaced(value: str | None) -> str | None:
+    """CLI lists use commas ("25%,50%"); profiles use spaces like tc."""
+    return " ".join(value.replace(",", " ").split()) if value else None
 
 
 def _unknown(name: str) -> Profile:
