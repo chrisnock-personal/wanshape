@@ -125,7 +125,7 @@ class TimerUnitTests(unittest.TestCase):
                                       load_profiles()["3g"], 300)
         self.assertTrue(ok)
         clear_args = schedule.call_args[0][2]
-        self.assertEqual(clear_args[-2:], ["--iface", "eth1"])
+        self.assertEqual(clear_args[-4:], ["--iface", "eth1", "--only-netns", "99"])
 
     def test_unit_names_have_no_dots_and_dont_collide(self):
         self.assertNotIn(".", timer.unit_name("vm", "web.service"))
@@ -379,8 +379,57 @@ class CleanupFailureTests(unittest.TestCase):
                 mock.patch("sys.stderr", new_callable=io.StringIO) as err:
             code = cli._run_host_plans(backend, plans, a, load_profiles()["3g"], None)
         self.assertEqual(code, 1)
-        self.assertEqual([c.args[1] for c in undo.call_args_list], ["b", "a"])
+        # b's own failure is undone by run_plan; a, already applied, is undone here.
+        self.assertEqual([c.args[1] for c in undo.call_args_list], ["a"])
         self.assertIn("could not undo", err.getvalue())
+
+
+class ThirdReviewTests(unittest.TestCase):
+    def test_timer_clear_skips_a_restarted_container(self):
+        a = argparse.Namespace(container=["web"], runtime=None, iface=None, direction="both",
+                               dry_run=False, only_netns=1)
+        with mock.patch.object(cli, "resolve", return_value=target()), \
+                mock.patch.object(cli, "_clear_container") as clear, \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            cli._Commands.clear(a)
+        clear.assert_not_called()
+        self.assertIn("restarted since this timer was set", out.getvalue())
+
+    def test_failed_run_plan_keeps_existing_shaping(self):
+        plan = build_host_apply("sip", load_profiles()["3g"], parse_ports("5060"), "eth0",
+                                "both", HostLive())
+        a = argparse.Namespace(keep_going=False, direction="both")
+        with mock.patch.object(cli, "run_plan", side_effect=CommandError(["tc"], 2, "x")), \
+                mock.patch.object(cli, "require_root"), \
+                mock.patch.object(cli, "_undo_host_target") as undo, \
+                mock.patch.object(cli, "_tidy_clsact"), \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            cli._run_host_plans(FakeBackend(), [("sip", plan)], a, load_profiles()["3g"], 60)
+        undo.assert_not_called()
+        self.assertIn("failed and was rolled back", err.getvalue())
+
+    def test_timer_failure_undoes_and_says_if_cleanup_failed(self):
+        plan = build_host_apply("sip", load_profiles()["3g"], parse_ports("5060"), "eth0",
+                                "both", HostLive())
+        a = argparse.Namespace(keep_going=False, direction="both")
+        with mock.patch.object(cli, "run_plan"), \
+                mock.patch.object(cli, "require_root"), \
+                mock.patch.object(cli, "_host_timer", side_effect=WanshapeError("no systemd")), \
+                mock.patch.object(cli, "_undo_host_target", side_effect=WanshapeError("tc")), \
+                mock.patch.object(cli, "_tidy_clsact"), \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            cli._run_host_plans(FakeBackend(), [("sip", plan)], a, load_profiles()["3g"], 60)
+        self.assertIn("only partly rolled back", err.getvalue())
+
+    def test_pre_upgrade_remote_target_still_refuses_local_ports(self):
+        old = HostSlot(0, "a", "3g", "eth0", [], "both", True, peer="10.0.0.1")
+        live = HostLive(slots={0: old}, ifbs={"wsh0up", "wsh0dn"},
+                        ifaces={"eth0": IfaceState(clsact=True, egress_prefs={49300})})
+        with self.assertRaisesRegex(ConflictError, "older wanshape"):
+            build_host_apply("b", load_profiles()["3g"], parse_ports("5060"), "eth0", "both",
+                             live)
+        live.ifaces["eth0"].egress_prefs = {50300}   # re-applied: now in the remote band
+        build_host_apply("b", load_profiles()["3g"], parse_ports("5060"), "eth0", "both", live)
 
 
 if __name__ == "__main__":

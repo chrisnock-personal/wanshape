@@ -102,7 +102,7 @@ The tap comes from `virsh domiflist` and must carry the MAC libvirt gives a gues
 
 - Resolve, plan and validate **every** target in a command before changing anything; with several targets, undo the ones done if a later one fails (unless `--keep-going`).
 - Re-check the namespace inode before each change.
-- Host and VM changes (apply, clear, the libvirt hook) hold a lock (`/run/wanshape/lock`, in a root-owned 0700 directory; `WANSHAPE_LOCK_DIR` overrides it for tests), so two runs can't plan against the same free slot. The libvirt hook waits at most 30 s for it, and only for VMs and operations it acts on.
+- Host and VM changes (apply, clear, the libvirt hook) hold a lock (`/run/wanshape/lock`, in a root-owned 0700 directory), so two runs can't plan against the same free slot. The libvirt hook waits at most 30 s for it, and only for VMs and operations it acts on.
 - A failed apply undoes only what that run created, never a device or filter that was already there.
 - Never replace another tool's root qdisc, `clsact` filters or IFB without `--force` (container mode); never touch another tool's filters in host or VM mode.
 - Roll back a failed apply.

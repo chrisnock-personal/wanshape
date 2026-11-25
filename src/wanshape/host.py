@@ -475,6 +475,11 @@ def build_host_apply(
                       if a.overlaps(b)]
             peer_only = not ports and not remote_ports
             other_peer_only = not other.ports and not other.remote_ports
+            # A target applied before v0.4 has its remote-side filters in the local
+            # band, so the precedence above doesn't hold for it: keep refusing.
+            if ports and (other.remote_ports or other_peer_only) and _legacy_band(
+                    other, live.iface(iface)):
+                clash += [f"{other.name} was applied by an older wanshape; re-apply it first"]
             if (peer_only and (other.remote_ports or other_peer_only)) or (
                     other_peer_only and (remote_ports or peer_only)):
                 clash += [f"peer {peer or 'any'}/{other.peer or 'any'}"]
@@ -556,6 +561,13 @@ def build_host_apply(
     return HostPlan(slot=slot, commands=commands + fresh)
 
 
+def _legacy_band(slot: HostSlot, state: IfaceState) -> bool:
+    """True when a ports target's remote-side filters are still in the local band."""
+    prefs = state.egress_prefs | state.ingress_prefs
+    return (slot.kind == "ports" and bool(prefs & set(slot_prefs(slot.slot)))
+            and not prefs & set(slot_prefs(slot.slot, remote=True)))
+
+
 def _free_slot(live: HostLive, iface: str) -> int:
     state = live.iface(iface)
     used_prefs = state.egress_prefs | state.ingress_prefs
@@ -626,7 +638,7 @@ def run_plan(backend, commands: Sequence[Command]) -> None:
         done.append(command)
 
 
-LOCK_DIR = Path(os.environ.get("WANSHAPE_LOCK_DIR", "/run/wanshape"))
+LOCK_DIR = Path("/run/wanshape")   # fixed: every root run must agree on it
 
 
 @contextlib.contextmanager

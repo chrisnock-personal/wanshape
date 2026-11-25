@@ -130,6 +130,7 @@ def _parser() -> argparse.ArgumentParser:
     clear.add_argument("--runtime", choices=("podman", "docker"))
     clear.add_argument("--iface")
     clear.add_argument("--dry-run", action="store_true")
+    clear.add_argument("--only-netns", type=int, help=argparse.SUPPRESS)   # used by timers
     return parser
 
 
@@ -363,6 +364,12 @@ class _Commands:
     def clear(args: argparse.Namespace) -> int:
         targets = [resolve(name, args.runtime, args.iface) for name in _names(args.container)]
         for target in targets:
+            only = getattr(args, "only_netns", None)
+            if only is not None and only != target.netns_inode:
+                # A --duration timer from before the container was restarted: its
+                # shaping went with the old namespace; leave the new one alone.
+                print(f"{target.name}: restarted since this timer was set; nothing to clear")
+                continue
             _clear_container(target, args)
         return 0
 
@@ -439,7 +446,8 @@ def _apply_container(prep, args: argparse.Namespace, profile: Profile,
         timer.cancel_legacy("container", target.name)   # a pre-0.4 timer for this name
         if seconds:
             timer.schedule(unit, seconds, ["clear", target.id, "--runtime", target.runtime,
-                                           "--iface", target.iface])
+                                           "--iface", target.iface,
+                                           "--only-netns", str(target.netns_inode)])
         else:
             timer.cancel(unit)
     except WanshapeError as exc:
@@ -495,18 +503,36 @@ def _run_host_plans(backend, plans, args: argparse.Namespace, profile: Profile,
     require_root()
     done, failed = [], []
     for name, plan in plans:
+        error: WanshapeError | None = None
+        cleaned = True
         try:
+            # On failure run_plan itself undoes exactly what it created, and nothing
+            # that was there before.
             run_plan(backend, plan.commands)
-            _host_timer(plan.slot.kind, name, seconds)
         except WanshapeError as exc:
+            error = exc
+        else:
             try:
-                _undo_host_target(backend, name)   # e.g. the timer couldn't be scheduled
-                if plan.slot.added_clsact:   # only a clsact wanshape added or co-owned
+                _host_timer(plan.slot.kind, name, seconds)
+            except WanshapeError as exc:
+                # The shaping this run applied is complete but has no timer: take it
+                # off again (only this run's target exists under this name now).
+                error = exc
+                try:
+                    _undo_host_target(backend, name)
+                except WanshapeError as cleanup:
+                    cleaned = False
+                    print(f"wanshape: {name}: clean-up: {cleanup}", file=sys.stderr)
+        if error is not None:
+            if plan.slot.added_clsact:   # only a clsact wanshape added or co-owned
+                try:
                     _tidy_clsact(backend, plan.slot.iface)
-            except WanshapeError as cleanup:   # keep going: the others still need undoing
-                print(f"wanshape: {name}: clean-up after the failure: {cleanup}",
-                      file=sys.stderr)
-            print(f"wanshape: {name}: failed and was rolled back: {exc}", file=sys.stderr)
+                except WanshapeError as cleanup:
+                    cleaned = False
+                    print(f"wanshape: {name}: clean-up: {cleanup}", file=sys.stderr)
+            print(f"wanshape: {name}: failed and was "
+                  + ("rolled back" if cleaned else "only partly rolled back; check "
+                     "`wanshape status`") + f": {error}", file=sys.stderr)
             failed.append(name)
             if not args.keep_going:
                 for done_name, done_plan in reversed(done):
