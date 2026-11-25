@@ -1,8 +1,8 @@
 # wanshape
 
-Apply netem/tc WAN impairments (latency, jitter, packet loss including bursty loss, bandwidth) to **one named container** on Podman and Docker, without changing the container image or giving it extra capabilities.
+Apply netem/tc WAN impairments (latency, jitter, packet loss including bursty loss, bandwidth) to **one container, one service's ports, or one libvirt virtual machine**, without changing the container image or the VM, and without touching the rest of the machine's traffic.
 
-Two modes:
+Three modes:
 
 | Mode | For | How | Needs |
 |---|---|---|---|
@@ -15,6 +15,7 @@ Status: an MVP (v0.3.0). The container and host modes are tested end to end on F
 ## Requirements
 
 - Linux with `tc` and `ip` (iproute2), `nsenter`, and `podman` and/or `docker`.
+- For VM mode: libvirt's `virsh`, and VMs on a `network` or `bridge` interface.
 - Kernel support for `sch_netem`, `ifb`, `act_mirred`, `cls_matchall` and (host mode) `cls_flower`, built in or loadable. They normally load on first use.
 - Python 3.11+, no third-party packages.
 

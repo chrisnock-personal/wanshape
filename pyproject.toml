@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "wanshape"
 version = "0.3.0"
-description = "Apply netem/tc WAN impairments to individual Podman/Docker containers"
+description = "Apply netem/tc WAN impairments to one container, one service's ports, or one libvirt VM"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = []
