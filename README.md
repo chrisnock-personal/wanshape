@@ -23,14 +23,17 @@ Run `wanshape doctor` to check the host.
 
 ## Install
 
-Run it from the checkout:
+Into its own environment, with [pipx](https://pipx.pypa.io/) (or `uv tool install`):
 
 ```sh
-./bin/wanshape --help
-sudo ./bin/wanshape apply-host ...      # host mode needs root
+pipx install git+https://github.com/chrisnock-personal/wanshape
+wanshape doctor
+sudo "$(command -v wanshape)" apply-host ...     # host and VM modes need root
 ```
 
-Or install it for your user with `python3 -m pip install --user -e .`. That copy isn't on root's path, so use `./bin/wanshape` with sudo.
+`sudo` resets `PATH`, so give it the full path as above; a pipx install keeps working under sudo because its environment doesn't depend on your home directory. (A `pip install --user` copy doesn't: under sudo it can't find its own package.)
+
+Or run it straight from a checkout, no install: `./bin/wanshape ...` and `sudo ./bin/wanshape ...`.
 
 ## Profiles
 

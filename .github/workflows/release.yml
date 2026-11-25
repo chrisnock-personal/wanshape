@@ -1,0 +1,41 @@
+name: Release
+
+# Push a tag like v0.4.0 to build the package and publish it to PyPI.
+# Publishing uses PyPI trusted publishing: no token is stored here. It needs a
+# one-time setup on PyPI (a "pending publisher" for project wanshape, this
+# repository, workflow release.yml, environment pypi).
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Version matches the tag
+        run: |
+          version=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          [ "v$version" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME != version $version"; exit 1; }
+      - run: pip install build && python -m build
+      - run: PYTHONPATH=src python -m unittest discover -s tests
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1

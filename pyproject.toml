@@ -9,6 +9,22 @@ description = "Apply netem/tc WAN impairments to one container, one service's po
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = []
+authors = [{ name = "Chris" }]
+keywords = ["netem", "tc", "network emulation", "wan", "podman", "docker", "libvirt", "voip", "testing"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Networking",
+    "Topic :: Software Development :: Testing",
+]
+
+[project.urls]
+Homepage = "https://github.com/chrisnock-personal/wanshape"
+Issues = "https://github.com/chrisnock-personal/wanshape/issues"
 
 [project.scripts]
 wanshape = "wanshape.cli:main"
