@@ -9,7 +9,7 @@ Two modes:
 | `apply` | containers with their own network (bridge, pasta, slirp4netns) | netem inside the container's network namespace, entered from the host with the host's `tc` | nothing for your own rootless containers; root for rootful ones |
 | `apply-host` | **host-network containers**, or any set of local ports | `flower` filters on a host interface pick out the target's ports and send only those packets through netem | root (`sudo`) |
 
-Status: an MVP (v0.2.0). Both modes are tested end to end on Fedora with rootless Podman (see [Tests](#tests)). Docker and WSL2 have not been tested yet. Design and background: [`docs/DESIGN.md`](docs/DESIGN.md), [`docs/SPIKE-RESULTS.md`](docs/SPIKE-RESULTS.md).
+Status: an MVP (v0.2.0). Both modes are tested end to end on Fedora and on WSL2 (Microsoft's 6.6 kernel) with rootless Podman, and host mode has been used on live SIP calls between two host-network CallRaven containers through FreePBX ([results](docs/SPIKE-RESULTS.md#wsl2-and-live-callraven-test--the-pc-2026-11-25)). Docker has not been tested yet. Design and background: [`docs/DESIGN.md`](docs/DESIGN.md), [`docs/SPIKE-RESULTS.md`](docs/SPIKE-RESULTS.md).
 
 ## Requirements
 
@@ -126,7 +126,6 @@ Things to know:
 ## Limitations
 
 - Docker support is written but untested (Docker isn't installed on the development machine).
-- WSL2 kernels haven't been checked yet: run `wanshape doctor` there first.
 - A rootful container needs root (`sudo`); the sidecar backend for non-root Docker users is designed but not built.
 - Shaping is lost when a container restarts (its network namespace goes away). `status` reports such entries as stale.
 - `--duration` (automatic clear) is not implemented.

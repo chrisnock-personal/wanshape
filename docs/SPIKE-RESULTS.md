@@ -87,3 +87,42 @@ A throwaway rootless netavark-bridge container (`wanshape-proto`) was used to ex
 - All of the above on WSL2's networking stack, including pasta loopback splicing.
 - Rootful Docker and rootful Podman (Docker is not installed on the laptop).
 - Egress-loss behaviour for TCP vs UDP, reordering with `pfifo` child, and host port-filter mode.
+
+# WSL2 and live CallRaven test — the PC, 2026-11-25
+
+Environment: Fedora 44 under WSL2 (mirrored networking), kernel `6.6.114.1-microsoft-standard-WSL2`,
+iproute2 6.17.0, rootless Podman. FreePBX 17 on a VMware VM on the same Windows host (192.168.1.167).
+
+## Kernel
+
+`sch_netem`, `ifb`, `act_mirred`, `cls_matchall` and `cls_flower` are all available as modules on
+Microsoft's kernel and load on first use. No custom kernel needed. Loading `ifb` also creates two idle
+devices, `ifb0` and `ifb1` (the module's `numifbs=2` default); they are not wanshape's.
+
+## Test suites
+
+Unit tests, `tests/integration/host_mode.sh` and `tests/integration/netns_mode.sh` (rootless bridge,
+pasta, keep-id) all pass on WSL2.
+
+## Host mode against CallRaven
+
+The CallRaven tester (`callraven`, host networking, ext 1114, SIP 5060, RTP 10000-20000) called the
+agent CallRaven (ext 1112) through FreePBX; the agent auto-answered with its echo responder on. Only the
+tester was shaped, with `sudo ./bin/wanshape apply-host callraven --via 192.168.1.167` (ports read from
+its environment; interface `eth0`). G.722 calls; figures from CallRaven's `/api/stats` and
+`/api/audiotest` (10 tone probes through the echo).
+
+| Run | RTCP RTT | Probe round trip (avg) | Jitter | CallRaven rx loss | MOS | netem drops up / down |
+|---|---|---|---|---|---|---|
+| baseline | 1 ms | 4 ms | 6 ms | 0.0% | 4.37 | — |
+| `3g` (150 ms ±30 each way, 1%) | 356 ms | 367 ms | 13 ms | 0.2% | 3.91 | 35 / 122 (~1.1%) |
+| `lossy-sip` (50 ms ±15, gemodel), re-applied over `3g` | 120 ms | 123 ms | 13 ms | 1.5% | 4.17 | 62 / 261 (~3%) |
+| after `clear-host` | 4 ms | 5 ms | 7 ms | 0.0% | 4.37 | — |
+
+Delay and jitter land as configured, re-apply works on the live host, and `clear-host` removed every
+filter, both IFBs and the `clsact` it added. All 10 probes came back on every run.
+
+Open: CallRaven's loss figures are lower than what netem dropped (rx 0.2% vs ~1.1%; 1.5% vs ~3%), and
+its `remoteLossPercent` stayed 0 although uplink packets were dropped. Its `rxPackets` is also about
+3.5x `txPackets` on a G.722 call. These look like questions about how CallRaven counts, worth checking
+in CallRaven against a pcap, not wanshape behaviour.
