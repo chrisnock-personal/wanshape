@@ -66,6 +66,38 @@ class PlannerTests(unittest.TestCase):
         self.assertFalse(any("mirred" in c for c in plan.ingress))
         self.assertIn("netem", plan.ingress[-1])
 
+    def test_no_reorder_applies_to_incoming_too(self):
+        plan = build_apply_plan(profile(reorder=False), "eth0", "ingress", clean())
+        self.assertIn(["tc", "qdisc", "replace", "dev", "wanshape0", "parent", "5753:1",
+                       "pfifo", "limit", "1000"], plan.ingress)
+
+    def test_accurate_rate_builds_htb_tree(self):
+        p = profile(reorder=False)
+        p.rate_mode = "accurate"
+        plan = build_apply_plan(p, "eth0", "both", clean())
+        egress = [" ".join(c) for c in plan.egress]
+        self.assertEqual(egress, [
+            "tc qdisc replace dev eth0 root handle 5753: htb default 1",
+            "tc class replace dev eth0 parent 5753: classid 5753:1 htb rate 768kbit ceil 768kbit",
+            "tc qdisc replace dev eth0 parent 5753:1 handle 5754: netem delay 150ms 30ms "
+            "distribution normal limit 1000",
+            "tc qdisc replace dev eth0 parent 5754:1 pfifo limit 1000",
+        ])
+        self.assertIn("rate 1600kbit ceil 1600kbit", " ".join(" ".join(c) for c in plan.ingress))
+
+    def test_accurate_without_rate_is_plain_netem(self):
+        p = Profile(name="x", rate_mode="accurate", up=Direction(delay="10ms"),
+                    down=Direction(delay="10ms"))
+        plan = build_apply_plan(p, "eth0", "egress", clean())
+        self.assertIn("netem", plan.egress[0])
+
+    def test_reapply_over_htb_rebuilds(self):
+        live = LiveState(root_kind="htb", root_handle="5753:", clsact=False,
+                         our_filter=False, ifb=False)
+        self.assertTrue(live.egress)
+        plan = build_apply_plan(profile(), "eth0", "egress", live)
+        self.assertEqual(plan.egress[0], ["tc", "qdisc", "del", "dev", "eth0", "root"])
+
     def test_empty_clsact_is_not_foreign(self):
         live = LiveState(root_kind="noqueue", root_handle="0:", clsact=True,
                          our_filter=False, ifb=False)

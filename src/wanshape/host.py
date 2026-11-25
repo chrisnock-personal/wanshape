@@ -45,6 +45,7 @@ from .errors import (
     WanshapeError,
 )
 from .inspector import HANDLE
+from .planner import netem_tree
 from .profiles import Profile
 
 PREF_BASE = 49300
@@ -487,12 +488,8 @@ def build_host_apply(
         fresh += [
             ["ip", "link", "add", dev, "type", "ifb"],
             ["ip", "link", "set", "dev", dev, "up"],
-            ["tc", "qdisc", "add", "dev", dev, "root", "handle", HANDLE,
-             "netem", *spec.netem_args()],
+            *netem_tree("add", dev, spec, profile),
         ]
-        if not profile.reorder_on_jitter:
-            fresh.append(["tc", "qdisc", "add", "dev", dev, "parent", f"{HANDLE}1",
-                          "pfifo", "limit", "1000"])
     fresh.append(["ip", "link", "set", "dev", slot.up, "alias", alias])
     if not clsact_present:
         fresh.append(["tc", "qdisc", "add", "dev", iface, "clsact"])

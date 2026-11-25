@@ -192,3 +192,16 @@ TCP retransmits as much with the loss on the sender's side as at the receiver, a
 same, so the drop is not masked: netem on current kernels doesn't report it to the socket. UDP loses
 about the configured share either way (the runs are short, so the figures are noisy). No caveat is
 needed in `show` or `status`.
+
+# netem rate vs HTB ("--rate-mode accurate") — laptop, 2026-11-25
+
+`apply-host` in a private namespace, outgoing only, 10 ms delay and a 4 mbit/s cap; iperf3 TCP for 6 s,
+then UDP offered at 8 mbit/s for 6 s. Two runs each, the same both times:
+
+| rate mode | TCP received | UDP dropped | UDP jitter |
+|---|---|---|---|
+| netem's own `rate` | 3.77 mbit/s | 27.4% | 0.18-0.20 ms |
+| HTB class + netem below it | 3.76 mbit/s | 27.3% | 0.20 ms |
+
+No measurable difference on this kernel; `accurate` stays opt-in. (UDP loss is below 50% because the
+queued packets still arrive after the 6 s send.)

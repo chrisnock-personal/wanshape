@@ -148,6 +148,9 @@ def _add_profile_args(parser: argparse.ArgumentParser) -> None:
                         help="egress = upload from the target, ingress = download")
     parser.add_argument("--no-reorder", action="store_true",
                         help="attach pfifo under netem to prevent jitter reordering")
+    parser.add_argument("--rate-mode", choices=("netem", "accurate"),
+                        help="accurate: HTB enforces --rate, netem adds the rest "
+                        "(steadier than netem's own rate); also overrides a profile's")
     parser.add_argument("--dry-run", action="store_true", help="print commands only")
     parser.add_argument("--keep-going", action="store_true",
                         help="with several targets: if one fails, keep the others "
@@ -591,8 +594,19 @@ def _clear_host(args: argparse.Namespace) -> int:
 
 
 def _profile_from_args(args: argparse.Namespace) -> Profile:
+    profile = _base_profile(args)
+    if getattr(args, "rate_mode", None):
+        profile.rate_mode = args.rate_mode
+        profile.validate()
+    return profile
+
+
+def _base_profile(args: argparse.Namespace) -> Profile:
     if args.profile:
-        return load_profiles()[args.profile] if args.profile in load_profiles() else _unknown(args.profile)
+        profiles = load_profiles()
+        if args.profile not in profiles:
+            _unknown(args.profile)
+        return profiles[args.profile]
     # CLI form is gemodel:P,R,1-H,1-K; the profile form is "gemodel P R 1-H 1-K".
     loss_model = (
         " ".join(args.loss_model.replace(":", ",").split(",")).strip()

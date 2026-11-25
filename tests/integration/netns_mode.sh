@@ -115,6 +115,14 @@ ws apply ws-it-q1 --delay 10ms 2>&1 >/dev/null | grep -q "shares its network nam
 ws clear ws-it-q2 > /dev/null
 echo "ok   --network container: and pods: warned, one state entry, clear via any member"
 
+echo "# --rate-mode accurate (#17)"
+ws apply ws-it-a --delay 20ms --rate 2mbit --rate-mode accurate --no-reorder > /dev/null
+expect "HTB rate tree, 20 ms each way" ws-it-b "$A_IP" 9999 35 70
+ws status ws-it-a | grep -q "egress=on ingress=on" || fail "status doesn't recognise the HTB root"
+ws clear ws-it-a > /dev/null
+expect "HTB tree cleared" ws-it-b "$A_IP" 9999 0 10
+echo "ok   accurate rate mode applies, shows and clears"
+
 echo "# --duration"
 ws apply ws-it-a --delay 30ms --duration 5s | grep -q "clears in" || fail "no time limit reported"
 ws status ws-it-a | grep -q "(clears in " || fail "status doesn't show the time limit"

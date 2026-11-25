@@ -24,7 +24,7 @@ class LiveState:
 
     @property
     def egress(self) -> bool:
-        return self.root_handle == HANDLE and self.root_kind in ("netem", "pfifo")
+        return self.root_handle == HANDLE and self.root_kind in ("netem", "htb")
 
     @property
     def ingress(self) -> bool:

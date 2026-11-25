@@ -117,6 +117,13 @@ class ApplyTests(unittest.TestCase):
         netem = next(c for c in plan.commands if "netem" in c)
         self.assertIn("gemodel", netem)
 
+    def test_accurate_rate_on_ifbs(self):
+        p = profile("3g")
+        p.rate_mode = "accurate"
+        plan = build_host_apply("cr", p, parse_ports("5060"), "eth0", "both", HostLive())
+        self.assertIn(["tc", "class", "add", "dev", "wsh0up", "parent", "5753:", "classid",
+                       "5753:1", "htb", "rate", "768kbit", "ceil", "768kbit"], plan.commands)
+
     def test_foreign_clsact_is_kept(self):
         live = HostLive(ifaces={"eth0": IfaceState(clsact=True, egress_prefs={1})})
         plan = build_host_apply("cr", profile(), parse_ports("5060"), "eth0", "both", live)

@@ -56,6 +56,9 @@ More netem options, as CLI flags (inline settings) or profile fields:
 | `--slot 10ms,30ms` | `slot = "10ms 30ms"` | hold packets and release them in bursts, as Wi-Fi and LTE schedulers do |
 | `--seed 42` | `seed` | fixed random seed, for runs you can repeat |
 | `--raw-netem "ecn"` | `raw` | any other netem arguments, appended as given |
+| `--rate-mode accurate` | `rate_mode = "accurate"` (profile level) | HTB enforces the rate and netem adds the rest, instead of netem's own rate |
+
+`--rate-mode accurate` exists because tc-netem(8) warns that netem's own rate is affected by timer granularity. On Fedora's 7.3 kernel the two measured the same (TCP 3.76 vs 3.77 mbit/s at a 4 mbit/s cap, identical UDP loss and jitter), so it's opt-in, for kernels or VMs with coarser timers.
 
 Your own profiles go in `~/.config/wanshape/profiles.toml` and are added to the built-ins (or override them):
 

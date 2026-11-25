@@ -305,7 +305,7 @@ class Direction:
         if self.raw is not None and not str(self.raw).strip():
             raise ProfileError(f"{label}: raw is empty")
 
-    def netem_args(self) -> list[str]:
+    def netem_args(self, include_rate: bool = True) -> list[str]:
         args: list[str] = []
         if self.delay:
             args += ["delay", self.delay]
@@ -326,7 +326,7 @@ class Direction:
             args += ["corrupt", self.corrupt]
         if self.reorder:
             args += ["reorder", *str(self.reorder).split()]
-        if self.rate:
+        if self.rate and include_rate:
             args += ["rate", self.rate]
         if self.slot:
             args += ["slot", *str(self.slot).split()]
@@ -345,8 +345,11 @@ class Profile:
     reorder_on_jitter: bool = True
     up: Direction = field(default_factory=Direction)
     down: Direction = field(default_factory=Direction)
+    rate_mode: str = "netem"  # "accurate": HTB does the rate, netem below it
 
     def validate(self) -> None:
+        if self.rate_mode not in ("netem", "accurate"):
+            raise ProfileError(f"{self.name}: rate_mode must be netem or accurate")
         self.up.validate(f"{self.name}.up")
         self.down.validate(f"{self.name}.down")
 
@@ -378,13 +381,14 @@ def _direction_from(label: str, raw: dict) -> Direction:
 
 
 def _profile_from(name: str, raw: dict) -> Profile:
-    unknown = set(raw) - {"description", "reorder_on_jitter", "up", "down"}
+    unknown = set(raw) - {"description", "reorder_on_jitter", "rate_mode", "up", "down"}
     if unknown:
         raise ProfileError(f"{name}: unknown setting(s) {', '.join(sorted(unknown))}")
     return Profile(
         name=name,
         description=str(raw.get("description", "")),
         reorder_on_jitter=bool(raw.get("reorder_on_jitter", True)),
+        rate_mode=str(raw.get("rate_mode", "netem")),
         up=_direction_from(f"{name}.up", raw.get("up", {})),
         down=_direction_from(f"{name}.down", raw.get("down", {})),
     )
