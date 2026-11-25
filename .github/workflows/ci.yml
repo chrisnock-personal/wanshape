@@ -84,9 +84,17 @@ jobs:
           sudo apt-get install -yq "linux-modules-extra-$(uname -r)" || echo "no modules-extra for $(uname -r)"
           for m in sch_netem ifb act_mirred cls_flower cls_matchall; do sudo modprobe "$m" || echo "modprobe $m failed"; done
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Cached CirrOS image
+        id: cirros
+        uses: actions/cache@v4
+        with:
+          path: cirros-0.6.2-x86_64-disk.img
+          key: cirros-0.6.2-x86_64-c8fc807773e5354afe61636071771906
       - name: CirrOS guest image
+        if: steps.cirros.outputs.cache-hit != 'true'
         run: |
-          curl -fsSLO https://download.cirros-cloud.net/0.6.2/cirros-0.6.2-x86_64-disk.img
-          curl -fsSL https://download.cirros-cloud.net/0.6.2/MD5SUMS \
-            | grep " cirros-0.6.2-x86_64-disk.img$" | md5sum -c -
+          curl -fsSLO --retry 5 --retry-all-errors --connect-timeout 20 \
+            https://download.cirros-cloud.net/0.6.2/cirros-0.6.2-x86_64-disk.img
+      - name: Check the image
+        run: echo "c8fc807773e5354afe61636071771906  cirros-0.6.2-x86_64-disk.img" | md5sum -c -
       - run: WANSHAPE_VM_IMAGE=$PWD/cirros-0.6.2-x86_64-disk.img sh tests/integration/vm_mode.sh
