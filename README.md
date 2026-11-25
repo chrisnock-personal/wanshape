@@ -1,5 +1,7 @@
 # wanshape
 
+[![CI](https://github.com/chrisnock-personal/wanshape/actions/workflows/ci.yml/badge.svg)](https://github.com/chrisnock-personal/wanshape/actions/workflows/ci.yml)
+
 Apply netem/tc WAN impairments (latency, jitter, packet loss including bursty loss, bandwidth) to **one container, one service's ports, or one libvirt virtual machine**, without changing the container image or the VM, and without touching the rest of the machine's traffic.
 
 Three modes:
@@ -10,12 +12,12 @@ Three modes:
 | `apply-host` | **host-network containers**, or any set of local ports | `flower` filters on a host interface pick out the target's ports and send only those packets through netem | root (`sudo`) |
 | `apply-vm` | **libvirt VMs** on a `network`, `bridge` or `direct` (macvtap) interface | all traffic on the VM's host-side tap or macvtap device goes through netem | root (`sudo`) |
 
-Status: an MVP (v0.3.0). The container and host modes are tested end to end on Fedora and on WSL2 (Microsoft's 6.6 kernel) with rootless Podman, and host mode has been used on live SIP calls between two host-network CallRaven containers through FreePBX ([results](docs/SPIKE-RESULTS.md#wsl2-and-live-callraven-test--the-pc-2026-11-25)). VM mode is tested on libvirt VMs under WSL2: tap and macvtap interfaces, VM-to-VM traffic, a VM restart and `--duration`. Docker has not been tested yet. Design and background: [`docs/DESIGN.md`](docs/DESIGN.md), [`docs/SPIKE-RESULTS.md`](docs/SPIKE-RESULTS.md).
+Status: early but working (v0.4.0). Container and host modes are tested end to end on Fedora, on WSL2 (Microsoft's 6.6 kernel) and on GitHub's Ubuntu runners, with rootless Podman and rootful Docker; host mode has been used on live SIP calls between two host-network CallRaven containers through FreePBX ([results](docs/SPIKE-RESULTS.md#wsl2-and-live-callraven-test--the-pc-2026-11-25)). VM mode is tested on libvirt VMs under WSL2: tap and macvtap interfaces, VM-to-VM traffic, a VM restart and `--duration`. Design and background: [`docs/DESIGN.md`](docs/DESIGN.md), [`docs/SPIKE-RESULTS.md`](docs/SPIKE-RESULTS.md).
 
 ## Requirements
 
 - Linux with `tc` and `ip` (iproute2), `nsenter`, and `podman` and/or `docker`.
-- For VM mode: libvirt's `virsh`, and VMs on a `network` or `bridge` interface.
+- For VM mode: libvirt's `virsh`, and VMs on a `network`, `bridge` or `direct` (macvtap) interface.
 - Kernel support for `sch_netem`, `ifb`, `act_mirred`, `cls_matchall` and (host mode) `cls_flower`, built in or loadable. They normally load on first use.
 - Python 3.11+, no third-party packages.
 
@@ -162,7 +164,7 @@ Things to know:
 
 ## VM mode: `apply-vm`
 
-Shapes everything a libvirt VM sends and receives on one interface, including traffic to other VMs on the same bridge. wanshape asks libvirt which host device the VM uses (`virsh domiflist`) and checks that the device's MAC is the one libvirt gives that VM's tap.
+Shapes everything a libvirt VM sends and receives on one interface, including traffic to other VMs on the same bridge. wanshape asks libvirt which host device the VM uses (`virsh domiflist`) and checks that the device's MAC belongs to that VM (libvirt gives a tap the guest's MAC with `fe` as the first byte; a macvtap device has the guest's MAC itself).
 
 ```sh
 sudo ./bin/wanshape apply-vm freepbx --profile lossy-sip --dry-run
@@ -173,7 +175,7 @@ wanshape status
 sudo ./bin/wanshape clear-vm freepbx
 ```
 
-`--direction egress` is the VM's upload (what it sends), `ingress` its download. It uses the same engine as host mode: the VM's tap gets a `clsact` qdisc and a pair of IFBs, its root qdisc is untouched, and the state is kept in the kernel.
+`--direction egress` is the VM's upload (what it sends), `ingress` its download. It uses the same engine as host mode: the VM's device gets a `clsact` qdisc and a pair of IFBs, its root qdisc is untouched, and the state is kept in the kernel.
 
 - **Supported:** `network` and `bridge` interfaces (and `ethernet`), which use a tap device, and `direct` interfaces, which use a macvtap device (whose hooks run the other way round; wanshape handles that). Traffic between VMs on the same bridge or macvtap parent is shaped too. **Not supported:** `user`/passt networking, which has no host device; use `apply-host --ports` for the ports it forwards. A macvtap guest can't be reached from its own host (a macvtap limitation), so test it from another VM or machine.
 - **A VM restart loses the shaping**, because libvirt recreates the tap, often under a new name. `status` marks the target STALE; run `apply-vm` again, or let wanshape do it: `apply-vm --persist` records the VM's settings in `/etc/wanshape/vms.json`, and a libvirt hook installed once with `sudo wanshape install-vm-hook` (then restart `virtqemud` or `libvirtd`) re-applies them whenever libvirt starts the VM. `clear-vm` forgets them; `uninstall-vm-hook` removes the hook.
@@ -185,8 +187,7 @@ sudo ./bin/wanshape clear-vm freepbx
 
 ## Limitations
 
-- Docker support is written but untested (Docker isn't installed on the development machine).
-- A rootful container needs root (`sudo`); the sidecar backend for non-root Docker users is designed but not built.
+- A rootful container (Docker, or rootful Podman) needs root (`sudo`). A sidecar-container backend for docker-group users without sudo was designed but isn't planned: with root, wanshape already shapes rootful containers directly.
 - Shaping is lost when a container restarts (its network namespace goes away). `status` reports such entries as stale.
 - Loss on outgoing traffic behaves like real network loss for both TCP and UDP: measured, TCP retransmitted about as much as with the same loss at the receiver, and UDP lost about the configured share ([measurement](docs/SPIKE-RESULTS.md#loss-on-the-way-out-tcp-and-udp--laptop-2026-11-25)).
 
@@ -198,6 +199,8 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v   # unit tests, no privi
 sh tests/integration/host_mode.sh     # host mode on a veth pair in a private user+net namespace; no root needed
 sh tests/integration/netns_mode.sh    # rootless Podman bridge, pasta and keep-id containers; needs the python:3.12-slim image
 WANSHAPE_VM_IMAGE=cirros-0.6.2-x86_64-disk.img sh tests/integration/vm_mode.sh   # KVM guest on a tap, no root
+sudo sh tests/integration/docker_mode.sh   # rootful Docker containers; needs root and Docker
+sh tools/measure-profiles.sh [profile ...]  # what each profile does to an RTP-like stream
 ```
 
-The integration tests measure real round-trip times with and without shaping, and check that everything is removed afterwards.
+The integration tests measure real round-trip times with and without shaping, and check that everything is removed afterwards. CI runs all of them on GitHub Actions (`.github/workflows/ci.yml`).
