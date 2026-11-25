@@ -115,6 +115,21 @@ ws apply ws-it-q1 --delay 10ms 2>&1 >/dev/null | grep -q "shares its network nam
 ws clear ws-it-q2 > /dev/null
 echo "ok   --network container: and pods: warned, one state entry, clear via any member"
 
+echo "# --duration"
+ws apply ws-it-a --delay 30ms --duration 5s | grep -q "clears in" || fail "no time limit reported"
+ws status ws-it-a | grep -q "(clears in " || fail "status doesn't show the time limit"
+expect "shaped until the timer fires" ws-it-b "$A_IP" 9999 55 90
+for i in $(seq 1 30); do
+    ws status ws-it-a | grep -q "egress=off ingress=off" && break; sleep 1
+done
+ws status ws-it-a | grep -q "egress=off ingress=off" || fail "the timer did not clear the shaping"
+expect "cleared by the timer" ws-it-b "$A_IP" 9999 0 10
+systemctl --user list-timers --all | grep -q wanshape-clear-container-ws-it-a && fail "timer left behind"
+ws apply ws-it-a --delay 30ms --duration 1h > /dev/null
+ws clear ws-it-a > /dev/null
+systemctl --user list-timers --all | grep -q wanshape-clear-container-ws-it-a && fail "clear left the timer"
+echo "ok   --duration clears by itself, and clear cancels the timer"
+
 echo "# pasta (rootless default)"
 python3 -c "$ECHO_PY" 39999 &
 ECHO=$!

@@ -85,11 +85,14 @@ wanshape apply my-container --profile 3g --dry-run
 
 wanshape apply my-container --profile 3g                  # both directions
 wanshape apply my-container --delay 100ms --direction ingress
+wanshape apply my-container --profile 3g --duration 10m    # clears itself after 10 minutes
 wanshape status [my-container]                            # read from the kernel, with counters
 wanshape status --all                                     # also scan every running container
 wanshape status --prune                                   # forget containers that are gone
 wanshape clear my-container
 ```
+
+`--duration` (on `apply`, `apply-host` and `apply-vm`) sets a one-shot systemd timer that runs wanshape's own `clear`: your user's systemd for rootless containers, the system's under sudo. `status` shows the time left; `clear`, or applying again without `--duration`, cancels it.
 
 Applying again replaces the settings. `--force` replaces another tool's root qdisc or ingress filter; without it, wanshape refuses to change them.
 
@@ -165,7 +168,6 @@ sudo ./bin/wanshape clear-vm freepbx
 - Docker support is written but untested (Docker isn't installed on the development machine).
 - A rootful container needs root (`sudo`); the sidecar backend for non-root Docker users is designed but not built.
 - Shaping is lost when a container restarts (its network namespace goes away). `status` reports such entries as stale.
-- `--duration` (automatic clear) is not implemented.
 - Loss on outgoing traffic behaves like real network loss for both TCP and UDP: measured, TCP retransmitted about as much as with the same loss at the receiver, and UDP lost about the configured share ([measurement](docs/SPIKE-RESULTS.md#loss-on-the-way-out-tcp-and-udp--laptop-2026-11-25)).
 
 ## Tests

@@ -31,6 +31,7 @@ from .profiles import Direction, Profile, ProfileError, load_profiles
 from .state import load_state, make_entry, save_state
 from .target import Target, netns_members, resolve
 from .vm import resolve_vm
+from . import timer
 
 EXIT_ERROR = 1
 EXIT_UNSUPPORTED = 2
@@ -60,7 +61,6 @@ def _parser() -> argparse.ArgumentParser:
     apply_cmd.add_argument("--force", action="store_true", help="replace foreign qdisc/filters")
     apply_cmd.add_argument("--allow-partial", action="store_true",
                            help="if one direction fails, keep the other instead of rolling back")
-    apply_cmd.add_argument("--duration", help="not implemented in this prototype")
 
     host = sub.add_parser(
         "apply-host",
@@ -148,6 +148,9 @@ def _add_profile_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-reorder", action="store_true",
                         help="attach pfifo under netem to prevent jitter reordering")
     parser.add_argument("--dry-run", action="store_true", help="print commands only")
+    parser.add_argument("--duration", metavar="TIME",
+                        help="clear automatically after this long, e.g. 90s, 5m, 1h "
+                        "(a one-shot systemd timer)")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -215,8 +218,7 @@ class _Commands:
 
     @staticmethod
     def apply(args: argparse.Namespace) -> int:
-        if args.duration:
-            raise WanshapeError("--duration is not implemented in this prototype")
+        seconds = _duration(args)
         profile = _profile_from_args(args)
         target = resolve(args.container, args.runtime, args.iface)
         backend = get_backend(target, args.backend)
@@ -255,7 +257,13 @@ class _Commands:
             else:
                 _rollback(target, backend, plan)
             return EXIT_ERROR
-        return _save_and_report(target, profile.name, args.direction, live, plan)
+        unit = timer.unit_name("container", target.name)
+        if seconds:
+            timer.schedule(unit, seconds, ["clear", target.id, "--runtime", target.runtime])
+        else:
+            timer.cancel(unit)
+        return _save_and_report(target, profile.name, args.direction, live, plan,
+                                until=timer.until(seconds) if seconds else None)
 
     @staticmethod
     def status(args: argparse.Namespace) -> int:
@@ -306,7 +314,9 @@ class _Commands:
             gone = not host_live.iface(slot.iface).exists
             what = (f"vm mode, device={slot.iface}" if slot.kind == "vm"
                     else f"host mode, iface={slot.iface} {slot.describe()}")
+            left = timer.remaining(slot.until)
             print(f"{slot.name}: {what} profile={slot.profile} direction={slot.direction}"
+                  + (f" ({left})" if left else "")
                   + (f" STALE ({slot.iface} is gone; re-apply or clear-host)" if gone else ""))
             for dev in (slot.up, slot.down):
                 print(host_backend.run(["tc", "-s", "qdisc", "show", "dev", dev]).strip())
@@ -320,9 +330,11 @@ class _Commands:
             shown += 1
             profile = entry.get("profile", "unknown") if entry else "unknown"
             stale = bool(entry and entry.get("netns_inode") != target.netns_inode)
+            left = timer.remaining(entry.get("until")) if entry else None
             print(f"{target.name}: profile={profile}"
                   f" egress={'on' if live.egress else 'off'}"
                   f" ingress={'on' if live.ingress else 'off'}"
+                  + (f" ({left})" if left and (live.egress or live.ingress) else "")
                   + (" STALE (container recreated)" if stale else ""))
             if live.egress or live.ingress:
                 print(stats(backend, target.iface))
@@ -350,6 +362,7 @@ class _Commands:
         for command in plan.commands:
             target.verify()
             backend.run(command)
+        timer.cancel(timer.unit_name("container", target.name))
         entries = load_state()
         for key in [k for k, e in entries.items()
                     if k == target.id or e.get("netns_inode") == target.netns_inode]:
@@ -360,6 +373,7 @@ class _Commands:
 
 
 def _apply_host(args: argparse.Namespace) -> int:
+    seconds = _duration(args)
     profile = _profile_from_args(args)
     remote = (parse_ports(args.remote_ports) if args.remote_ports
               else remote_ports_from_container(args.name, args.runtime))
@@ -369,7 +383,8 @@ def _apply_host(args: argparse.Namespace) -> int:
     iface = resolve_host_iface(backend, args.iface, args.via or args.peer)
     live = inspect_host(backend, [iface])
     plan = build_host_apply(args.name, profile, ports, iface, args.direction, live,
-                            remote_ports=remote, peer=args.peer)
+                            remote_ports=remote, peer=args.peer,
+                            until=timer.until(seconds) if seconds else None)
     print(f"# host target: {args.name}, {plan.slot.describe()} (local ports from {source})")
     print(f"# iface {iface}, slot {plan.slot.slot}, {args.direction}")
     for command in plan.commands:
@@ -382,18 +397,20 @@ def _apply_host(args: argparse.Namespace) -> int:
     except CommandError as exc:
         print(f"wanshape: apply-host failed and was rolled back: {exc}", file=sys.stderr)
         return EXIT_ERROR
+    _host_timer("ports", args.name, seconds)
     print(f"{args.name}: applied {profile.name} to {args.direction} on {iface} "
           f"{plan.slot.describe()}")
     return 0
 
 
 def _apply_vm(args: argparse.Namespace) -> int:
+    seconds = _duration(args)
     profile = _profile_from_args(args)
     iface = resolve_vm(args.domain, args.connect, args.mac)
     backend = HostBackend()
     live = inspect_host(backend, [iface.device])
     plan = build_host_apply(args.domain, profile, [], iface.device, args.direction, live,
-                            kind="vm")
+                            kind="vm", until=timer.until(seconds) if seconds else None)
     print(f"# VM: {args.domain}, {iface.type} {iface.source}, MAC {iface.mac}")
     print(f"# host device {iface.device}, slot {plan.slot.slot}, {args.direction} "
           "(egress = from the VM)")
@@ -407,8 +424,28 @@ def _apply_vm(args: argparse.Namespace) -> int:
     except CommandError as exc:
         print(f"wanshape: apply-vm failed and was rolled back: {exc}", file=sys.stderr)
         return EXIT_ERROR
+    _host_timer("vm", args.domain, seconds)
     print(f"{args.domain}: applied {profile.name} to {args.direction} on {iface.device}")
     return 0
+
+
+def _duration(args: argparse.Namespace) -> int | None:
+    """Parse --duration and check a timer can be set, before anything changes."""
+    if not getattr(args, "duration", None):
+        return None
+    seconds = timer.parse_duration(args.duration)
+    if not args.dry_run:
+        timer.check_available()
+    return seconds
+
+
+def _host_timer(kind: str, name: str, seconds: int | None) -> None:
+    unit = timer.unit_name(kind, name)
+    if seconds:
+        timer.schedule(unit, seconds, ["clear-host", name])
+        print(f"{name}: {timer.remaining(timer.until(seconds))}")
+    else:
+        timer.cancel(unit)
 
 
 def _clear_host(args: argparse.Namespace) -> int:
@@ -433,6 +470,7 @@ def _clear_host(args: argparse.Namespace) -> int:
             continue
         require_root()
         run_plan(backend, commands)
+        timer.cancel(timer.unit_name(slot.kind, slot.name))
         label = "VM" if slot.kind == "vm" else "host-mode"
         print(f"{slot.name}: cleared {label} shaping on {slot.iface}")
         # Later slots must see this one gone (e.g. to decide on removing clsact).
@@ -560,7 +598,8 @@ def _scan_running() -> list[Target]:
     return found
 
 
-def _save_and_report(target, profile_name, direction, live, plan, partial=False) -> int:
+def _save_and_report(target, profile_name, direction, live, plan, partial=False,
+                     until=None) -> int:
     entries = load_state()
     prior_root_qdisc = plan.prior_root_qdisc or "unknown"
     added_clsact = plan.added_clsact
@@ -577,10 +616,12 @@ def _save_and_report(target, profile_name, direction, live, plan, partial=False)
         if live.clsact and live.our_filter:
             added_clsact = bool(previous.get("added_clsact")) or added_clsact
     entries[target.id] = make_entry(
-        target, profile_name, direction, prior_root_qdisc, added_clsact
+        target, profile_name, direction, prior_root_qdisc, added_clsact, until
     )
     save_state(entries)
     suffix = " (partial)" if partial else ""
+    if until:
+        suffix += f", {timer.remaining(until)}"
     print(f"{target.name}: applied {profile_name} to {direction}{suffix}")
     return 0
 

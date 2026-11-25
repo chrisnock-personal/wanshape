@@ -190,6 +190,7 @@ class HostSlot:
     kind: str = "ports"  # "ports" or "vm"
     remote_ports: list[PortRange] = field(default_factory=list)
     peer: str | None = None  # only traffic with this address
+    until: int | None = None  # epoch seconds when a --duration timer clears it
 
     @property
     def up(self) -> str:
@@ -207,6 +208,8 @@ class HostSlot:
             extra += f" rports={format_ports(self.remote_ports)}"
         if self.peer:
             extra += f" peer={self.peer}"
+        if self.until:
+            extra += f" until={self.until}"
         return (
             f"{ALIAS_PREFIX} name={self.name} kind={self.kind} profile={self.profile} "
             f"iface={self.iface} ports={ports} dir={self.direction} "
@@ -281,6 +284,7 @@ def parse_alias(slot: int, alias: str) -> HostSlot | None:
             kind=kind,
             remote_ports=parse_ports(fields["rports"]) if "rports" in fields else [],
             peer=fields.get("peer"),
+            until=int(fields["until"]) if fields.get("until", "").isdigit() else None,
         )
     except (KeyError, WanshapeError):
         return None
@@ -393,6 +397,7 @@ def build_host_apply(
     kind: str = "ports",
     remote_ports: list[PortRange] | None = None,
     peer: str | None = None,
+    until: int | None = None,
 ) -> HostPlan:
     """Plan a ports target, or with kind="vm" (and no ports) a whole tap device."""
     remote_ports = list(remote_ports or [])
@@ -467,7 +472,7 @@ def build_host_apply(
     slot = HostSlot(
         slot=slot_no, name=name, profile=profile.name, iface=iface,
         ports=list(ports), direction=direction, added_clsact=added_clsact, kind=kind,
-        remote_ports=remote_ports, peer=peer,
+        remote_ports=remote_ports, peer=peer, until=until,
     )
     if len(slot.filters()) > PREFS_PER_SLOT:
         raise WanshapeError(

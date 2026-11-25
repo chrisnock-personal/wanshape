@@ -40,7 +40,7 @@ def save_state(entries: dict[str, dict]) -> None:
 
 
 def make_entry(target, profile_name: str, direction: str, prior_qdisc: str,
-               added_clsact: bool) -> dict:
+               added_clsact: bool, until: int | None = None) -> dict:
     return {
         "id": target.id,
         "name": target.name,
@@ -51,5 +51,5 @@ def make_entry(target, profile_name: str, direction: str, prior_qdisc: str,
         "applied_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "prior_root_qdisc": prior_qdisc,
         "added_clsact": added_clsact,
-        "timer": None,
+        "until": until,  # epoch seconds when a --duration timer clears it
     }
