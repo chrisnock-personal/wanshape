@@ -5,6 +5,7 @@ from unittest import mock
 
 from tests.fakes import FakeBackend
 from wanshape import cli
+from wanshape.errors import CommandError
 from wanshape.inspector import LiveState
 from wanshape.target import Target
 
@@ -184,7 +185,7 @@ class FailingBackend(FakeBackend):
     def run(self, args):
         if args[:3] == ["ip", "link", "add"]:
             self.commands.append(list(args))
-            raise cli.CommandError(self.command(args), 2, "Error: Unknown device type.")
+            raise CommandError(self.command(args), 2, "Error: Unknown device type.")
         return super().run(args)
 
 
@@ -330,7 +331,12 @@ class SharedNetnsTests(unittest.TestCase):
         self.assertTrue(self.state["abc"]["added_clsact"])
 
     def test_clear_via_another_member_removes_the_entry(self):
-        with mock.patch("sys.stdout", new_callable=io.StringIO):
+        shaped = LiveState(root_kind="netem", root_handle="5753:", clsact=True,
+                           our_filter=True, ifb=True)
+        clean = LiveState(root_kind="noqueue", root_handle="0:", clsact=False,
+                          our_filter=False, ifb=False)
+        with mock.patch("sys.stdout", new_callable=io.StringIO), \
+                mock.patch.object(cli, "inspect_live", side_effect=[shaped, clean]):
             cli._Commands.clear(argparse.Namespace(
                 container="test", runtime=None, iface=None, direction="both", dry_run=False))
         self.assertEqual(self.state, {})

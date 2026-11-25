@@ -380,7 +380,12 @@ def _direction_from(label: str, raw: dict) -> Direction:
     return Direction(**{k: str(v) for k, v in raw.items()})
 
 
+_PROFILE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+
+
 def _profile_from(name: str, raw: dict) -> Profile:
+    if not _PROFILE_NAME.match(name):
+        raise ProfileError(f"invalid profile name {name!r}: letters, digits, '.', '_', '-'")
     unknown = set(raw) - {"description", "reorder_on_jitter", "rate_mode", "up", "down"}
     if unknown:
         raise ProfileError(f"{name}: unknown setting(s) {', '.join(sorted(unknown))}")
@@ -394,10 +399,24 @@ def _profile_from(name: str, raw: dict) -> Profile:
     )
 
 
+def _config_home() -> Path:
+    """$XDG_CONFIG_HOME, else ~/.config; under sudo, the invoking user's ~/.config."""
+    if os.environ.get("XDG_CONFIG_HOME"):
+        return Path(os.environ["XDG_CONFIG_HOME"])
+    sudo_user = os.environ.get("SUDO_USER")
+    if os.geteuid() == 0 and sudo_user and sudo_user != "root":
+        try:
+            import pwd
+            return Path(pwd.getpwnam(sudo_user).pw_dir) / ".config"
+        except KeyError:
+            pass
+    return Path.home() / ".config"
+
+
 def load_profiles() -> dict[str, Profile]:
     """Load built-ins, then overlay the user's config file."""
     data = tomllib.loads(BUILTIN_TOML)
-    config = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    config = _config_home()
     user_file = config / "wanshape" / "profiles.toml"
     if user_file.is_file():
         with user_file.open("rb") as fh:

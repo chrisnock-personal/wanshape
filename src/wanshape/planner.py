@@ -133,8 +133,9 @@ def build_clear_plan(
             plan.ingress.append(
                 ["tc", "filter", "del", "dev", iface, "ingress", "pref", FILTER_PREF]
             )
-        # Remove clsact if wanshape added it, or if nothing but our filter is on it.
-        if live.clsact and (added_clsact or not live.foreign_filters):
+        # Remove clsact only when nothing but our filter is on it, even if wanshape
+        # added it: another tool may have put filters there since.
+        if live.clsact and not live.foreign_filters:
             plan.ingress.append(["tc", "qdisc", "del", "dev", iface, "clsact"])
         if live.ifb:
             plan.ingress.append(["ip", "link", "del", IFB])

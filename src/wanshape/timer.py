@@ -19,7 +19,8 @@ from pathlib import Path
 from .errors import PrerequisiteError, WanshapeError
 
 _DURATION = re.compile(r"^(\d+(?:\.\d+)?)(s|m|h)?$")
-_UNIT_SAFE = re.compile(r"[^A-Za-z0-9_.-]")
+# '.' is replaced too: systemd would read "web.service" as a unit type suffix.
+_UNIT_SAFE = re.compile(r"[^A-Za-z0-9_-]")
 
 
 def parse_duration(text: str) -> int:

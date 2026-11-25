@@ -12,11 +12,12 @@ from pathlib import Path
 
 from . import timer, vmhook
 from .backends import get_backend
-from .errors import CommandError, WanshapeError
+from .errors import WanshapeError
 from .host import (
     HostBackend,
     build_host_apply,
     build_host_clear,
+    host_lock,
     host_ports_for,
     inspect_host,
     parse_ports,
@@ -30,7 +31,7 @@ from .planner import build_apply_plan, build_clear_plan
 from .profiles import Direction, Profile, ProfileError, load_profiles
 from .state import load_state, make_entry, save_state
 from .target import Target, netns_members, resolve
-from .vm import device_kind, resolve_vm
+from .vm import canonical_name, device_kind, resolve_vm
 
 EXIT_ERROR = 1
 EXIT_UNSUPPORTED = 2
@@ -170,11 +171,15 @@ def _add_profile_args(parser: argparse.ArgumentParser) -> None:
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
+        locked = {"apply-host", "apply-vm", "clear-host", "clear-vm", "vm-hook"}
         handler = {"apply-host": _apply_host, "clear-host": _clear_host,
                    "clear-vm": _clear_host, "apply-vm": _apply_vm, "vm-hook": _vm_hook,
                    "install-vm-hook": _install_vm_hook,
                    "uninstall-vm-hook": _uninstall_vm_hook}.get(
             args.command) or getattr(_Commands, args.command)
+        if args.command in locked and not getattr(args, "dry_run", False):
+            with host_lock():
+                return handler(args)
         return handler(args)
     except ProfileError as exc:
         print(f"wanshape: invalid profile: {exc}", file=sys.stderr)
@@ -268,7 +273,7 @@ class _Commands:
             if not args.keep_going:
                 for target, backend, _, plan in reversed(done):
                     _rollback(target, backend, plan)
-                    timer.cancel(timer.unit_name("container", target.name))
+                    timer.cancel(_container_unit(target))
                 return EXIT_ERROR
         return _summary([p[0].name for p in done], failed)
 
@@ -382,8 +387,18 @@ def _clear_container(target: Target, args: argparse.Namespace) -> None:
     for command in plan.commands:
         target.verify()
         backend.run(command)
-    timer.cancel(timer.unit_name("container", target.name))
+    left = inspect_live(backend, target.iface)
     entries = load_state()
+    if left.egress or left.ingress:
+        # Only one direction was cleared: keep the entry (and any timer) for the other.
+        entry = _entry_for(entries, target)
+        if entry is not None:
+            entry["direction"] = "egress" if left.egress else "ingress"
+            save_state(entries)
+        print(f"{target.name}: cleared {args.direction}; "
+              f"{'egress' if left.egress else 'ingress'} still shaped")
+        return
+    timer.cancel(_container_unit(target))
     for key in [k for k, e in entries.items()
                 if k == target.id or e.get("netns_inode") == target.netns_inode]:
         entries.pop(key)
@@ -396,7 +411,7 @@ def _apply_container(prep, args: argparse.Namespace, profile: Profile,
     """Apply one planned container target; False if it failed (and was handled)."""
     target, backend, live, plan = prep
     applied: list[str] = []
-    failure: tuple[str, CommandError] | None = None
+    failure: tuple[str, WanshapeError] | None = None
     for group in ("egress", "ingress"):
         if not getattr(plan, group):
             continue
@@ -404,7 +419,7 @@ def _apply_container(prep, args: argparse.Namespace, profile: Profile,
             for command in getattr(plan, group):
                 target.verify()
                 backend.run(command)
-        except CommandError as exc:
+        except WanshapeError as exc:   # a failed command, or the target went away
             failure = (group, exc)
             break
         applied.append(group)
@@ -418,14 +433,25 @@ def _apply_container(prep, args: argparse.Namespace, profile: Profile,
         else:
             _rollback(target, backend, plan)
         return False
-    unit = timer.unit_name("container", target.name)
-    if seconds:
-        timer.schedule(unit, seconds, ["clear", target.id, "--runtime", target.runtime])
-    else:
-        timer.cancel(unit)
+    # One timer per network namespace: shared by every member of a pod.
+    unit = _container_unit(target)
+    try:
+        if seconds:
+            timer.schedule(unit, seconds, ["clear", target.id, "--runtime", target.runtime,
+                                           "--iface", target.iface])
+        else:
+            timer.cancel(unit)
+    except WanshapeError as exc:
+        print(f"wanshape: {target.name}: {exc}", file=sys.stderr)
+        _rollback(target, backend, plan)
+        return False
     _save_and_report(target, profile.name, args.direction, live, plan,
                      until=timer.until(seconds) if seconds else None)
     return True
+
+
+def _container_unit(target: Target) -> str:
+    return timer.unit_name("container", f"netns{target.netns_inode}")
 
 
 def _names(values) -> list[str]:
@@ -469,27 +495,43 @@ def _run_host_plans(backend, plans, args: argparse.Namespace, profile: Profile,
     done, failed = [], []
     for name, plan in plans:
         try:
-            run_plan(backend, plan.commands, plan.rollback)
-        except CommandError as exc:
+            run_plan(backend, plan.commands)
+            _host_timer(plan.slot.kind, name, seconds)
+        except WanshapeError as exc:
+            _undo_host_target(backend, name)   # e.g. the timer couldn't be scheduled
+            _tidy_clsact(backend, plan.slot.iface)
             print(f"wanshape: {name}: failed and was rolled back: {exc}", file=sys.stderr)
             failed.append(name)
             if not args.keep_going:
                 for done_name, done_plan in reversed(done):
-                    live = inspect_host(backend)
-                    slot = live.by_name(done_name)
-                    if slot:
-                        for command in build_host_clear(slot, live):
-                            backend.run_result(command)
+                    _undo_host_target(backend, done_name)
                     timer.cancel(timer.unit_name(done_plan.slot.kind, done_name))
                     print(f"wanshape: {done_name}: undone (use --keep-going to keep "
                           "the targets that worked)", file=sys.stderr)
                 return EXIT_ERROR
             continue
-        _host_timer(plan.slot.kind, name, seconds)
         print(f"{name}: applied {profile.name} to {args.direction} on {plan.slot.iface}"
               + (f" {plan.slot.describe()}" if plan.slot.describe() else ""))
         done.append((name, plan))
     return _summary([n for n, _ in done], failed)
+
+
+def _undo_host_target(backend, name: str) -> None:
+    live = inspect_host(backend)
+    slot = live.by_name(name)
+    if slot:
+        for command in build_host_clear(slot, live):
+            backend.run_result(command)
+
+
+def _tidy_clsact(backend, iface: str) -> None:
+    """Remove a clsact left with no filters and no wanshape target after a failure."""
+    live = inspect_host(backend, [iface])
+    state = live.iface(iface)
+    used = any(s.iface == iface for s in live.slots.values())
+    if state.exists and state.clsact and not used and not (
+            state.egress_prefs or state.ingress_prefs):
+        backend.run_result(["tc", "qdisc", "del", "dev", iface, "clsact"])
 
 
 def _apply_host(args: argparse.Namespace) -> int:
@@ -529,14 +571,15 @@ def _apply_vm(args: argparse.Namespace) -> int:
     names = _names(args.domain)
     if len(names) > 1 and args.mac:
         raise WanshapeError("--mac picks one VM's interface: give one VM with it")
-    vms = [(name, resolve_vm(name, args.connect, args.mac)) for name in names]
+    vms = [(canonical_name(name, args.connect), resolve_vm(name, args.connect, args.mac))
+           for name in names]
     backend = HostBackend()
     live = inspect_host(backend, [iface.device for _, iface in vms])
     plans = []
     for name, iface in vms:
         plan = build_host_apply(name, profile, [], iface.device, args.direction, live,
                                 kind="vm", until=timer.until(seconds) if seconds else None,
-                                device=device_kind(iface.type))
+                                device=device_kind(iface.type), mac=iface.mac)
         print(f"# VM: {name}, {iface.type} {iface.source}, MAC {iface.mac}")
         print(f"# host device {iface.device}, slot {plan.slot.slot}, {args.direction} "
               "(egress = from the VM)")
@@ -566,11 +609,11 @@ def _vm_hook(args: argparse.Namespace) -> int:
         xml_text = sys.stdin.read() if not sys.stdin.isatty() else ""
         backend = HostBackend()
 
-        def apply_fn(name, profile, direction, device, device_type="tap"):
+        def apply_fn(name, profile, direction, device, device_type="tap", mac=None):
             live = inspect_host(backend, [device])
             plan = build_host_apply(name, profile, [], device, direction, live, kind="vm",
-                                    device=device_type)
-            run_plan(backend, plan.commands, plan.rollback)
+                                    device=device_type, mac=mac)
+            run_plan(backend, plan.commands)
 
         def release_fn(name):
             live = inspect_host(backend)

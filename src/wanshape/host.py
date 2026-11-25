@@ -29,12 +29,15 @@ be read without root.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import ipaddress
 import json
 import os
 import re
 import subprocess
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable, Sequence
 
 from .errors import (
@@ -192,6 +195,7 @@ class HostSlot:
     peer: str | None = None  # only traffic with this address
     until: int | None = None  # epoch seconds when a --duration timer clears it
     device: str = "tap"  # VM mode: "tap" or "macvtap" (hooks the other way round)
+    mac: str | None = None  # VM mode: the guest's MAC, to spot a tap name reused by another VM
 
     @property
     def up(self) -> str:
@@ -213,6 +217,8 @@ class HostSlot:
             extra += f" until={self.until}"
         if self.kind == "vm" and self.device != "tap":
             extra += f" dev={self.device}"
+        if self.kind == "vm" and self.mac:
+            extra += f" mac={self.mac}"
         return (
             f"{ALIAS_PREFIX} name={self.name} kind={self.kind} profile={self.profile} "
             f"iface={self.iface} ports={ports} dir={self.direction} "
@@ -292,6 +298,7 @@ def parse_alias(slot: int, alias: str) -> HostSlot | None:
             peer=fields.get("peer"),
             until=int(fields["until"]) if fields.get("until", "").isdigit() else None,
             device=fields.get("dev", "tap"),
+            mac=fields.get("mac"),
         )
     except (KeyError, WanshapeError):
         return None
@@ -406,6 +413,7 @@ def build_host_apply(
     peer: str | None = None,
     until: int | None = None,
     device: str = "tap",
+    mac: str | None = None,
 ) -> HostPlan:
     """Plan a ports target, or with kind="vm" (and no ports) a whole tap device."""
     remote_ports = list(remote_ports or [])
@@ -430,19 +438,26 @@ def build_host_apply(
         raise ConflictError(
             f"{name!r} is already a {existing.kind} target; clear it first"
         )
+    stale_here = [o for o in live.slots.values()
+                  if o is not existing and o.iface == iface and o.kind == "vm" and kind == "vm"
+                  and o.mac and mac and o.mac != mac.lower()]
     for other in live.slots.values():
-        if other is existing or other.iface != iface:
+        if other is existing or other.iface != iface or other in stale_here:
             continue
         if kind == "vm" or other.kind == "vm":
             raise ConflictError(
                 f"{iface} is already shaped for {other.name!r}; "
                 f"clear it first with `wanshape clear-host {other.name}`"
             )
-        clash = [f"{a}/{b}" for a in ports for b in other.ports if a.overlaps(b)]
+        clash: list[str] = []
         if not peer or not other.peer or peer == other.peer:
-            clash += [f"remote {a}/{b}" for a in remote_ports for b in other.remote_ports
-                      if a.overlaps(b)]
-            if (not ports and not remote_ports) or (not other.ports and not other.remote_ports):
+            # Different peers can never match the same packet; otherwise any pair of
+            # port sets can: local against local, remote against remote, and local
+            # against remote (a packet from port 5060 to port 5060 matches both).
+            mine = ports + remote_ports
+            theirs = other.ports + other.remote_ports
+            clash += [f"{a}/{b}" for a in mine for b in theirs if a.overlaps(b)]
+            if not mine or not theirs:
                 clash += [f"peer {peer or 'any'}/{other.peer or 'any'}"]
         if clash:
             raise ConflictError(
@@ -451,6 +466,11 @@ def build_host_apply(
             )
 
     commands: list[Command] = []
+    for old in stale_here:
+        # A VM that was shaped on this device name has gone, and libvirt gave the
+        # name to this VM: its leftover filters and IFBs are cleared first.
+        commands += build_host_clear(old, live, keep_clsact=True)
+        live.slots.pop(old.slot, None)
     state = live.iface(iface)
     if state.ingress_qdisc and not state.clsact:
         raise ConflictError(
@@ -481,6 +501,7 @@ def build_host_apply(
         slot=slot_no, name=name, profile=profile.name, iface=iface,
         ports=list(ports), direction=direction, added_clsact=added_clsact, kind=kind,
         remote_ports=remote_ports, peer=peer, until=until, device=device,
+        mac=mac.lower() if mac else None,
     )
     if len(slot.filters()) > PREFS_PER_SLOT:
         raise WanshapeError(
@@ -559,15 +580,55 @@ def build_host_clear(slot: HostSlot, live: HostLive, keep_clsact: bool = False) 
 # ----------------------------------------------------------------- execution
 
 
+def _undo(command: Command) -> Command | None:
+    """The command that removes what `command` created, if it created something."""
+    if command[:3] == ["ip", "link", "add"]:
+        return ["ip", "link", "del", command[3]]
+    if command[:3] == ["tc", "filter", "add"]:
+        return ["tc", "filter", "del", *command[3:8]]      # dev D HOOK pref P
+    if command[:3] == ["tc", "qdisc", "add"] and command[-1] == "clsact":
+        return ["tc", "qdisc", "del", "dev", command[4], "clsact"]
+    return None   # qdiscs on our own IFBs go with the IFB
+
+
 def run_plan(backend, commands: Sequence[Command], rollback: Sequence[Command] = ()) -> None:
-    """Run commands in order; on failure undo with `rollback` (best effort) and re-raise."""
+    """Run commands in order; on failure undo what *this run* created, and re-raise.
+
+    Only the commands that succeeded are undone, in reverse order: if `ip link
+    add wsh0up` fails because the device exists (another run took the slot),
+    that device isn't ours and is left alone. `rollback` is kept for callers'
+    compatibility and is no longer used.
+    """
+    done: list[Command] = []
     for command in commands:
         try:
             backend.run(command)
-        except CommandError:
-            for undo in rollback:
+        except WanshapeError:
+            for undo in filter(None, map(_undo, reversed(done))):
                 backend.run_result(undo)
             raise
+        done.append(command)
+
+
+@contextlib.contextmanager
+def host_lock():
+    """Serialise host and VM changes (two applies would otherwise pick one slot).
+
+    Best effort: without permission to create the lock file (a non-root dry run)
+    it proceeds unlocked, since nothing is changed then.
+    """
+    path = Path(os.environ.get("WANSHAPE_LOCK", "/run/lock/wanshape.lock"))
+    try:
+        handle = open(path, "a")
+    except OSError:
+        yield
+        return
+    with handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 # --------------------------------------------------------------- containers
