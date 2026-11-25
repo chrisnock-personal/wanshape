@@ -96,12 +96,14 @@ The tap comes from `virsh domiflist` and must carry the MAC libvirt gives a gues
 
 **The kernel is the source of truth.**
 - *Container mode:* wanshape's qdiscs carry handle `5753:`, its ingress filter pref `49152`, its IFB is `wanshape0`. The state file (`$XDG_STATE_HOME/wanshape/state.json`) holds only what the kernel can't: the profile name, the root qdisc found before the first apply, whether wanshape added `clsact`, the namespace inode (to detect a recreated container) and the `--duration` expiry. `status --all` scans running containers for shaping the file doesn't know about; `status --prune` forgets gone or recreated containers.
-- *Host and VM modes:* no file. Each target's metadata (name, kind, profile, interface, ports, remote ports, peer, direction, clsact ownership, expiry) is the alias of its `wsh<N>up` IFB, readable without root. A target whose device has gone (VM restart) is shown as stale.
+- *Host and VM modes:* no file. Each target's metadata (name, kind, profile, interface, ports, remote ports, peer, direction, clsact ownership, expiry, and for VMs the device type and guest MAC) is the alias of its `wsh<N>up` IFB, readable without root. A VM slot whose device now carries another guest's MAC (libvirt reused the name) is taken over by the new VM's apply. A target whose device has gone (VM restart) is shown as stale.
 
 ## 6. Safety rules
 
 - Resolve, plan and validate **every** target in a command before changing anything; with several targets, undo the ones done if a later one fails (unless `--keep-going`).
 - Re-check the namespace inode before each change.
+- Host and VM changes (apply, clear, the libvirt hook) hold a lock (`/run/lock/wanshape.lock`), so two runs can't plan against the same free slot.
+- A failed apply undoes only what that run created, never a device or filter that was already there.
 - Never replace another tool's root qdisc, `clsact` filters or IFB without `--force` (container mode); never touch another tool's filters in host or VM mode.
 - Roll back a failed apply.
 - Clear removes only what wanshape added, and only removes `clsact` when nothing else uses it.
