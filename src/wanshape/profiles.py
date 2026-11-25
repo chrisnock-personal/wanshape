@@ -185,8 +185,10 @@ class Profile:
 
 
 def _to_ms(value: str) -> float:
-    number = float(value[:-2])
-    return number if value.endswith("ms") else number * (1000 if value.endswith("s") else 0.001)
+    for suffix, factor in (("us", 0.001), ("ms", 1.0), ("s", 1000.0)):
+        if value.endswith(suffix):
+            return float(value[: -len(suffix)]) * factor
+    raise ProfileError(f"invalid time {value!r}")
 
 
 def _profile_from(name: str, raw: dict) -> Profile:

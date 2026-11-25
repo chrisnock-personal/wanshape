@@ -62,7 +62,16 @@ class PlannerTests(unittest.TestCase):
         plan = build_apply_plan(profile(), "eth0", "both", live)
         self.assertNotIn(["ip", "link", "add", "wanshape0", "type", "ifb"], plan.ingress)
         self.assertEqual(plan.ingress[0], ["ip", "link", "set", "wanshape0", "up"])
-        self.assertIn("mirred", plan.ingress[2])
+        # Our matchall filter can't be replaced in place (EEXIST); it is kept.
+        self.assertFalse(any("mirred" in c for c in plan.ingress))
+        self.assertIn("netem", plan.ingress[-1])
+
+    def test_reapply_rebuilds_root_so_reordering_can_change(self):
+        live = LiveState(root_kind="netem", root_handle="5753:", clsact=False,
+                         our_filter=False, ifb=False)
+        plan = build_apply_plan(profile(reorder=True), "eth0", "egress", live)
+        self.assertEqual(plan.egress[0], ["tc", "qdisc", "del", "dev", "eth0", "root"])
+        self.assertFalse(any("pfifo" in c for c in plan.egress))
 
     def test_bursty_loss_args_are_split(self):
         p = Profile(

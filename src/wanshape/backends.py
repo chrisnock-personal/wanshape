@@ -5,7 +5,7 @@ from __future__ import annotations
 import subprocess
 from typing import Sequence
 
-from .errors import CommandError, WanshapeError
+from .errors import CommandError, PrerequisiteError, WanshapeError
 from .target import Target
 
 
@@ -52,7 +52,7 @@ def get_backend(target: Target, requested: str = "auto") -> Backend:
     if requested not in ("auto", "nsenter"):
         raise WanshapeError(f"unknown backend {requested!r}")
     if not target.rootless and not _is_root():
-        raise WanshapeError(
+        raise PrerequisiteError(
             "target is rootful: run wanshape as root or use --backend sidecar (phase 2)"
         )
     return NsenterBackend(target)

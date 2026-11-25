@@ -1,0 +1,14 @@
+#!/usr/bin/env python3
+"""Run wanshape from the checkout, e.g. `sudo ./bin/wanshape apply-host ...`.
+
+sudo resets PATH and HOME, so a `pip install --user -e .` isn't found under
+sudo; this launcher only needs python3.
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "src"))
+
+from wanshape.cli import main  # noqa: E402
+
+sys.exit(main())

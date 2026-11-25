@@ -8,7 +8,7 @@ import re
 import subprocess
 from dataclasses import dataclass
 
-from .errors import WanshapeError
+from .errors import UnsupportedTarget, WanshapeError
 
 _DEV = re.compile(r"\bdev\s+(\S+)")
 
@@ -81,9 +81,9 @@ def _build_target(runtime: str, obj: dict, name: str, iface: str | None) -> Targ
         raise WanshapeError(f"container {name!r} is not running")
     mode = obj.get("HostConfig", {}).get("NetworkMode") or "unknown"
     if mode == "host":
-        raise WanshapeError(
+        raise UnsupportedTarget(
             f"container {name!r} uses host networking: it has no per-container netns; "
-            "use a bridge network, or the planned `apply-host` port-filter mode"
+            f"use `wanshape apply-host {name}` to shape its ports on the host interface"
         )
     pid = int(state["Pid"])
     try:

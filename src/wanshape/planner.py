@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .backends import WanshapeError
+from .errors import ConflictError, WanshapeError
 from .inspector import FILTER_PREF, HANDLE, IFB, LiveState
 from .profiles import Profile
 
@@ -41,7 +41,7 @@ def build_apply_plan(
     if direction in ("egress", "both"):
         if live.root_handle != HANDLE and live.root_kind not in ("noqueue", "fq_codel"):
             if not force:
-                raise WanshapeError(
+                raise ConflictError(
                     f"{iface} has a foreign root qdisc "
                     f"({live.root_kind} {live.root_handle}); use --force to replace it"
                 )
@@ -51,6 +51,10 @@ def build_apply_plan(
                 "root", "handle", HANDLE, "netem", *profile.up.netem_args(),
             ]
         )
+        if live.root_handle == HANDLE and live.root_kind == "netem":
+            # Re-apply: `replace` would only change netem's options and keep any
+            # pfifo child from before, so rebuild the root to get the child right.
+            plan.egress.insert(0, ["tc", "qdisc", "del", "dev", iface, "root"])
         if not profile.reorder_on_jitter:
             plan.egress.append(
                 ["tc", "qdisc", "replace", "dev", iface, "parent", f"{HANDLE}1",
@@ -60,7 +64,7 @@ def build_apply_plan(
     if direction in ("ingress", "both"):
         if (live.clsact and not live.our_filter) or (live.ifb and not live.our_filter):
             if not force:
-                raise WanshapeError(
+                raise ConflictError(
                     f"{iface} already has foreign clsact/IFB state; use --force to replace it"
                 )
         plan.added_clsact = not live.clsact
@@ -71,12 +75,17 @@ def build_apply_plan(
         plan.ingress += [
             ["ip", "link", "set", IFB, "up"],
             ["tc", "qdisc", "replace", "dev", iface, "clsact"],
-            ["tc", "filter", "replace", "dev", iface, "ingress",
-             "pref", FILTER_PREF, "protocol", "all", "matchall",
-             "action", "mirred", "egress", "redirect", "dev", IFB],
-            ["tc", "qdisc", "replace", "dev", IFB, "root", "handle", HANDLE,
-             "netem", *profile.down.netem_args()],
         ]
+        if not live.our_filter:
+            # matchall can't be replaced in place (EEXIST), and ours never changes:
+            # it always redirects everything to the IFB. Keep it on re-apply.
+            plan.ingress.append(
+                ["tc", "filter", "replace", "dev", iface, "ingress",
+                 "pref", FILTER_PREF, "protocol", "all", "matchall",
+                 "action", "mirred", "egress", "redirect", "dev", IFB])
+        plan.ingress.append(
+            ["tc", "qdisc", "replace", "dev", IFB, "root", "handle", HANDLE,
+             "netem", *profile.down.netem_args()])
     return plan
 
 

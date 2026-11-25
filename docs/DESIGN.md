@@ -1,6 +1,6 @@
 # wanshape — design proposal
 
-**Status:** draft, 2026-11-25 (revision 6: phase-1 prototype scaffold added; see §14, `README.md` and `SPIKE-RESULTS.md`). Working name; rename is cheap before phase 1.
+**Status:** draft, 2026-11-25 (revision 7: MVP with host port-filter mode; see §10.1, §14 and `README.md`). Working name; rename is cheap before phase 1.
 **Scope of this document:** design and implementation notes. The Python prototype currently covers the phase-1 core described in §12; see `README.md` for what is and is not implemented.
 
 A CLI that applies netem/tc WAN impairments (latency, jitter, loss, bandwidth) to **one named container**, on both Podman and Docker, without requiring the container image to carry `tc` or the container to be started with special capabilities.
@@ -255,6 +255,16 @@ CallRaven and CallRaven-agent run with host networking, so **per-container shapi
 
 This limitation should be on the README's first screen, not buried in troubleshooting.
 
+### 10.1 As built (r7): host mode
+
+Option 1 is implemented as `wanshape apply-host` / `clear-host`, with three changes from the sketch above:
+
+- **No `prio` root on the host interface.** A `clsact` qdisc carries `flower` filters on both hooks; matching packets are redirected with `mirred` to a per-target IFB pair (`wsh<N>up` for egress, `wsh<N>dn` for ingress) whose root is the netem qdisc. Egress redirect to an IFB returns the packet to the original device after netem. The host's root qdisc and all non-matching traffic are untouched, and clearing a target deletes only its filters and IFBs.
+- **`flower` instead of `u32`.** `flower` matches port ranges directly (`src_port 10000-20000`), where `u32` would need each range split into value/mask prefixes. Four filters per range: IPv4/IPv6 x UDP/TCP.
+- **Local port only.** Egress matches `src_port`, ingress `dst_port`, so a remote peer that happens to use the same port numbers (FreePBX's RTP range is also 10000-20000) is not matched by accident.
+
+Each target takes a slot N in 0-9: filter prefs `49300 + 100*N` upwards on both hooks, and its metadata (name, profile, interface, ports, direction, clsact ownership) in the alias of `wsh<N>up`. The kernel is the whole state for host mode, readable without root, with no state file. `clsact` ownership is shared between wanshape targets on an interface, so whichever target is cleared last removes it, unless foreign filters remain. Ports come from `--ports`, else the container's `wanshape.ports` label, else its `*SIP_PORT` and `*PORT_LOW/HIGH` environment variables; overlapping targets on one interface are refused. Under sudo, rootless containers are inspected as `SUDO_USER`. On failure the apply is rolled back. Verified in `tests/integration/host_mode.sh` (veth pair in a private user+net namespace: UDP and TCP, ranges and single ports, re-apply, overlap refusal, two targets, ordered clears, nothing left behind).
+
 ## 11. Verification plan
 
 Test matrix — one container per row, apply `3g` with `--direction both`, then measure:
@@ -301,8 +311,8 @@ Remember `ping` may need `NET_RAW` or a permissive `net.ipv4.ping_group_range`; 
 
 ## 13. Open questions
 
-- Host-network answer (§10): port-filter mode in v1, shape at FreePBX, or move CallRaven to a bridge network? Decide in phase 0.
-- If port-filter mode is chosen: read ports from the container's environment (proposed in §10) or require `--ports` every time?
+- ~~Host-network answer (§10)~~ Port-filter mode, built in r7 (§10.1).
+- ~~Ports from the environment or `--ports`?~~ Both: `--ports` > `wanshape.ports` label > environment.
 - Final name (`wanshape` vs something in the `call*`/`*nest` family).
 - Python vs Go for the CLI: Python keeps the zero-dependency TOML story and matches the repo style; Go gives a single static binary that could be dropped into containers. The sidecar backend removes most of the need for that, so: Python.
 - Should `--duration` be dropped from v1 if `systemd-run --user` is not reliable in WSL? (WSL user sessions are unusual; verify during phase 3.)
@@ -310,6 +320,7 @@ Remember `ping` may need `NET_RAW` or a permissive `net.ipv4.ping_group_range`; 
 
 ## 14. Revision history
 
+- **r7, 2026-11-25** — MVP: `apply-host`/`clear-host` (§10.1: clsact + flower + IFB pair per target, kernel-only state in the IFB alias). Fixed: gemodel arguments passed to `tc` as one string; `--loss-model` CLI syntax; re-apply failing on the existing IFB and on the matchall filter (`EEXIST`, not replaceable even with a handle); re-apply losing the prior root qdisc and clsact ownership; leftover `pfifo` child when reordering is re-enabled; `1s` time values; exit codes now typed (2 unsupported, 3 prerequisite, 4 conflict). Integration tests for both modes; `netns_mode.sh` covers rootless bridge, pasta and `keep-id` with measured RTTs.
 - **r6, 2026-11-25** — phase-1 prototype scaffold: Python CLI, target resolver, nsenter backend, profiles, live inspector, planner/executor, state file, README and unit tests. Smoke-tested on a rootless Podman bridge container (dry-run, apply, status, clear and baseline restore). Sidecar backend, `apply-host`, `--duration` and WSL2 validation remain unimplemented.
 - **r5, 2026-11-25** — laptop phase-0 spike (`SPIKE-RESULTS.md`): both rootless netns-entry forms work on pasta, bridge and `keep-id`; `netem`/IFB/mirred/matchall autoload on demand; egress/ingress/both delay measured at 150/150/300 ms; `direct_qlen` workaround not needed here. Corrected r4: sidecar `--userns container:<target>` must be conditional — passing it for a target already in the caller's rootless userns fails with `EINVAL`.
 - **r4, 2026-11-25** — corrections to r3: the two CallRavens do **not** share an RTP range (tester SIP 5060 / RTP 10000–20000 + load 30000–30999; agent SIP 5062 / RTP 21000–21999), so ports distinguish them; `apply-host` reads a container's ports from its environment instead. `nsenter -U -n` as the owning user is expected to work (owner of a userns holds all capabilities in it and its descendants), so the two rootless entry forms are no longer ranked; `keep-id`/`auto` userns are children of the rootless userns, not siblings. Sidecar `--userns container:` is only strictly needed for targets with their own userns, but stays always-on.

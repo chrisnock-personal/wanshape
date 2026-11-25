@@ -4,12 +4,24 @@ from __future__ import annotations
 
 import argparse
 import shlex
+import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 from .backends import get_backend
+from .host import (
+    HostBackend,
+    build_host_apply,
+    build_host_clear,
+    format_ports,
+    host_ports_for,
+    inspect_host,
+    require_root,
+    resolve_host_iface,
+    run_plan,
+)
 from .errors import CommandError, WanshapeError
 from .inspector import HANDLE, inspect_live, stats
 from .planner import build_apply_plan, build_clear_plan
@@ -37,22 +49,35 @@ def _parser() -> argparse.ArgumentParser:
 
     apply_cmd = sub.add_parser("apply", help="apply a profile to a container")
     apply_cmd.add_argument("container")
-    mode = apply_cmd.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--profile", help="named profile")
-    mode.add_argument("--delay", help="inline profile: one-way delay, e.g. 150ms")
-    apply_cmd.add_argument("--jitter", help="delay variation, e.g. 30ms")
-    apply_cmd.add_argument("--loss", help="random loss percentage, e.g. 1%%")
-    apply_cmd.add_argument("--loss-model", help="bursty loss, e.g. gemodel:1%%,25%%,100%%,0%%")
-    apply_cmd.add_argument("--rate", help="bandwidth cap, e.g. 768kbit")
+    _add_profile_args(apply_cmd)
     apply_cmd.add_argument("--runtime", choices=("podman", "docker"))
     apply_cmd.add_argument("--iface", help="override the resolved interface")
-    apply_cmd.add_argument("--direction", choices=("egress", "ingress", "both"), default="both")
-    apply_cmd.add_argument("--no-reorder", action="store_true",
-                           help="attach pfifo under netem to prevent jitter reordering")
     apply_cmd.add_argument("--backend", choices=("auto", "nsenter", "sidecar"), default="auto")
-    apply_cmd.add_argument("--dry-run", action="store_true", help="print commands only")
     apply_cmd.add_argument("--force", action="store_true", help="replace foreign qdisc/filters")
     apply_cmd.add_argument("--duration", help="not implemented in this prototype")
+
+    host = sub.add_parser(
+        "apply-host",
+        help="shape a host-network container (or any ports) on a host interface; needs root",
+        description="Shape traffic by local port on a host interface. With a container "
+        "name, the ports come from its wanshape.ports label or its *SIP_PORT and "
+        "*PORT_LOW/HIGH environment variables; --ports overrides that, and then NAME is "
+        "only a label and needs no container.",
+    )
+    host.add_argument("name", help="host-network container, or a label when --ports is given")
+    _add_profile_args(host)
+    host.add_argument("--ports", help="local ports to shape, e.g. 5060,10000-20000 (UDP and TCP)")
+    host.add_argument("--runtime", choices=("podman", "docker"))
+    where = host.add_mutually_exclusive_group()
+    where.add_argument("--iface", help="host interface (default: the default route's)")
+    where.add_argument("--via", metavar="ADDRESS",
+                       help="use the interface that routes to ADDRESS, e.g. the PBX")
+
+    clear_host = sub.add_parser("clear-host", help="remove host-mode shaping")
+    target_group = clear_host.add_mutually_exclusive_group(required=True)
+    target_group.add_argument("name", nargs="?")
+    target_group.add_argument("--all", action="store_true", help="clear every host-mode target")
+    clear_host.add_argument("--dry-run", action="store_true")
 
     status = sub.add_parser("status", help="show live shaping state")
     status.add_argument("container", nargs="?")
@@ -66,17 +91,35 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _add_profile_args(parser: argparse.ArgumentParser) -> None:
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--profile", help="named profile")
+    mode.add_argument("--delay", help="inline profile: one-way delay, e.g. 150ms")
+    parser.add_argument("--jitter", help="delay variation, e.g. 30ms")
+    parser.add_argument("--distribution", choices=("uniform", "normal", "pareto", "paretonormal"),
+                        help="jitter distribution (inline profile)")
+    parser.add_argument("--loss", help="random loss percentage, e.g. 1%%")
+    parser.add_argument("--loss-model", help="bursty loss, e.g. gemodel:1%%,25%%,100%%,0%%")
+    parser.add_argument("--rate", help="bandwidth cap, e.g. 768kbit")
+    parser.add_argument("--direction", choices=("egress", "ingress", "both"), default="both",
+                        help="egress = upload from the target, ingress = download")
+    parser.add_argument("--no-reorder", action="store_true",
+                        help="attach pfifo under netem to prevent jitter reordering")
+    parser.add_argument("--dry-run", action="store_true", help="print commands only")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        handler = getattr(_Commands, args.command)
+        handler = {"apply-host": _apply_host, "clear-host": _clear_host}.get(
+            args.command) or getattr(_Commands, args.command)
         return handler(args)
     except ProfileError as exc:
         print(f"wanshape: invalid profile: {exc}", file=sys.stderr)
         return EXIT_ERROR
     except WanshapeError as exc:
         print(f"wanshape: {exc}", file=sys.stderr)
-        return EXIT_CONFLICT if "foreign" in str(exc) else EXIT_ERROR
+        return exc.exit_code
     except KeyboardInterrupt:
         print("wanshape: interrupted", file=sys.stderr)
         return 130
@@ -91,7 +134,7 @@ class _Commands:
             return EXIT_PREREQ
         print("tools: tc, nsenter, ip, podman found"
               + (" (docker also found)" if shutil.which("docker") else ""))
-        modules = ("sch_netem", "ifb", "act_mirred", "cls_matchall", "cls_u32")
+        modules = ("sch_netem", "ifb", "act_mirred", "cls_matchall", "cls_flower")
         for module in modules:
             if Path(f"/sys/module/{module}").exists():
                 status = "loaded"
@@ -99,6 +142,8 @@ class _Commands:
                 result = subprocess.run(["modinfo", module], text=True, capture_output=True)
                 status = "available (autoload on use)" if result.returncode == 0 else "NOT FOUND"
             print(f"{module}: {status}")
+        print("root: " + ("yes" if os.geteuid() == 0 else
+                          "no (fine for rootless containers; apply-host needs sudo)"))
         return 0
 
     @staticmethod
@@ -164,8 +209,13 @@ class _Commands:
         entries = load_state()
         targets: list[tuple[Target, dict | None]] = []
         if args.container:
-            target = resolve(args.container)
-            targets.append((target, entries.get(target.id)))
+            try:
+                target = resolve(args.container)
+                targets.append((target, entries.get(target.id)))
+            except WanshapeError:
+                # Host-network containers and --ports labels live in host mode only.
+                if not inspect_host(HostBackend()).by_name(args.container):
+                    raise
         else:
             for entry in entries.values():
                 target = None
@@ -181,7 +231,18 @@ class _Commands:
                     print(f"wanshape: {entry.get('name')}: container is gone", file=sys.stderr)
                     continue
                 targets.append((target, entry))
-        if not targets:
+        host_backend = HostBackend()
+        host_live = inspect_host(host_backend)
+        host_slots = [
+            slot for slot in sorted(host_live.slots.values(), key=lambda x: x.slot)
+            if not args.container or slot.name == args.container
+        ]
+        for slot in host_slots:
+            print(f"{slot.name}: host mode, profile={slot.profile} iface={slot.iface} "
+                  f"ports={format_ports(slot.ports)} direction={slot.direction}")
+            for dev in (slot.up, slot.down):
+                print(host_backend.run(["tc", "-s", "qdisc", "show", "dev", dev]).strip())
+        if not targets and not host_slots:
             print("no wanshape state found")
         for target, entry in targets:
             backend = get_backend(target)
@@ -223,6 +284,58 @@ class _Commands:
         return 0
 
 
+def _apply_host(args: argparse.Namespace) -> int:
+    profile = _profile_from_args(args)
+    ports, source = host_ports_for(args.name, args.runtime, args.ports)
+    backend = HostBackend()
+    iface = resolve_host_iface(backend, args.iface, args.via)
+    live = inspect_host(backend, [iface])
+    plan = build_host_apply(args.name, profile, ports, iface, args.direction, live)
+    print(f"# host target: {args.name}, ports {format_ports(ports)} (from {source})")
+    print(f"# iface {iface}, slot {plan.slot.slot}, {args.direction}")
+    for command in plan.commands:
+        print("+ " + shlex.join(command))
+    if args.dry_run:
+        return 0
+    require_root()
+    try:
+        run_plan(backend, plan.commands, plan.rollback)
+    except CommandError as exc:
+        print(f"wanshape: apply-host failed and was rolled back: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    print(f"{args.name}: applied {profile.name} to {args.direction} on {iface} "
+          f"ports {format_ports(ports)}")
+    return 0
+
+
+def _clear_host(args: argparse.Namespace) -> int:
+    backend = HostBackend()
+    live = inspect_host(backend)
+    if args.all:
+        slots = sorted(live.slots.values(), key=lambda x: x.slot)
+    else:
+        slot = live.by_name(args.name)
+        if not slot:
+            print(f"{args.name}: no host-mode shaping found")
+            return 0
+        slots = [slot]
+    if not slots:
+        print("no host-mode shaping found")
+        return 0
+    for slot in slots:
+        commands = build_host_clear(slot, live)
+        for command in commands:
+            print("+ " + shlex.join(command))
+        if args.dry_run:
+            continue
+        require_root()
+        run_plan(backend, commands)
+        print(f"{slot.name}: cleared host-mode shaping on {slot.iface}")
+        # Later slots must see this one gone (e.g. to decide on removing clsact).
+        live = inspect_host(backend)
+    return 0
+
+
 def _profile_from_args(args: argparse.Namespace) -> Profile:
     if args.profile:
         return load_profiles()[args.profile] if args.profile in load_profiles() else _unknown(args.profile)
@@ -234,6 +347,7 @@ def _profile_from_args(args: argparse.Namespace) -> Profile:
     direction = Direction(
         delay=args.delay,
         jitter=args.jitter,
+        distribution=getattr(args, "distribution", None),
         loss=args.loss,
         loss_model=loss_model,
         rate=args.rate,

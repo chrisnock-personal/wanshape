@@ -77,5 +77,17 @@ class ProfileTests(unittest.TestCase):
                     os.environ["XDG_CONFIG_HOME"] = old
 
 
+class TimeUnitTests(unittest.TestCase):
+    def test_to_ms(self):
+        from wanshape.profiles import _to_ms
+        self.assertEqual(_to_ms("1s"), 1000)
+        self.assertEqual(_to_ms("1.5s"), 1500)
+        self.assertEqual(_to_ms("20ms"), 20)
+        self.assertEqual(_to_ms("500us"), 0.5)
+
+    def test_jitter_in_seconds_validates(self):
+        Direction(delay="1s", jitter="200ms", distribution="normal").validate("t")
+
+
 if __name__ == "__main__":
     unittest.main()
