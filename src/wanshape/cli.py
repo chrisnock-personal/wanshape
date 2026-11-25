@@ -10,7 +10,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import timer
+from . import timer, vmhook
 from .backends import get_backend
 from .errors import CommandError, WanshapeError
 from .host import (
@@ -97,6 +97,14 @@ def _parser() -> argparse.ArgumentParser:
     vm.add_argument("--connect", "-c", default="qemu:///system", metavar="URI",
                     help="libvirt URI (default qemu:///system)")
     vm.add_argument("--mac", help="which interface, when the VM has several")
+    vm.add_argument("--persist", action="store_true",
+                    help="re-apply whenever libvirt starts the VM (needs install-vm-hook once)")
+
+    hook = sub.add_parser("vm-hook", help=argparse.SUPPRESS)
+    hook.add_argument("hook_args", nargs="*")
+    sub.add_parser("install-vm-hook",
+                   help="install the libvirt hook that re-applies --persist VM shaping; root")
+    sub.add_parser("uninstall-vm-hook", help="remove that libvirt hook; root")
 
     clear_host = sub.add_parser("clear-host", aliases=["clear-vm"],
                                 help="remove host-mode or VM shaping")
@@ -163,7 +171,9 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         handler = {"apply-host": _apply_host, "clear-host": _clear_host,
-                   "clear-vm": _clear_host, "apply-vm": _apply_vm}.get(
+                   "clear-vm": _clear_host, "apply-vm": _apply_vm, "vm-hook": _vm_hook,
+                   "install-vm-hook": _install_vm_hook,
+                   "uninstall-vm-hook": _uninstall_vm_hook}.get(
             args.command) or getattr(_Commands, args.command)
         return handler(args)
     except ProfileError as exc:
@@ -532,7 +542,60 @@ def _apply_vm(args: argparse.Namespace) -> int:
         plans.append((name, plan))
     if args.dry_run:
         return 0
-    return _run_host_plans(backend, plans, args, profile, seconds)
+    code = _run_host_plans(backend, plans, args, profile, seconds)
+    if code == 0 and args.persist:
+        for name, iface in vms:
+            vmhook.remember(name, profile, args.direction, iface.mac)
+        print(f"recorded in {vmhook.CONFIG}: re-applied whenever libvirt starts "
+              + ", ".join(n for n, _ in vms))
+        if not vmhook.HOOK.exists():
+            print("wanshape: the libvirt hook isn't installed yet: run "
+                  "`wanshape install-vm-hook` once", file=sys.stderr)
+    return code
+
+
+def _vm_hook(args: argparse.Namespace) -> int:
+    """Called by libvirt (see vmhook.py). Never fails, so it never blocks a VM start."""
+    hook_args = list(args.hook_args) + ["", "", ""]
+    domain, operation, sub_operation = hook_args[:3]
+    try:
+        xml_text = sys.stdin.read() if not sys.stdin.isatty() else ""
+        backend = HostBackend()
+
+        def apply_fn(name, profile, direction, device):
+            live = inspect_host(backend, [device])
+            plan = build_host_apply(name, profile, [], device, direction, live, kind="vm")
+            run_plan(backend, plan.commands, plan.rollback)
+
+        def release_fn(name):
+            live = inspect_host(backend)
+            slot = live.by_name(name)
+            if slot and not live.iface(slot.iface).exists:
+                for command in build_host_clear(slot, live):
+                    backend.run_result(command)
+
+        done = vmhook.run_hook(domain, operation, sub_operation, xml_text, apply_fn, release_fn)
+        if done != "not a wanshape VM":
+            print(f"wanshape vm-hook: {domain} {operation} {sub_operation}: {done}",
+                  file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001 - a hook must never fail the VM start
+        print(f"wanshape vm-hook: {domain} {operation} {sub_operation}: {exc}", file=sys.stderr)
+    return 0
+
+
+def _install_vm_hook(_args: argparse.Namespace) -> int:
+    require_root()
+    path = vmhook.install()
+    print(f"installed {path}")
+    print("libvirt reads its hooks when it starts: restart it once, e.g. "
+          "`sudo systemctl restart virtqemud` (or libvirtd)")
+    return 0
+
+
+def _uninstall_vm_hook(_args: argparse.Namespace) -> int:
+    require_root()
+    print(f"removed {vmhook.HOOK}" if vmhook.uninstall() else "the hook wasn't installed")
+    return 0
 
 
 def _duration(args: argparse.Namespace) -> int | None:
@@ -570,6 +633,12 @@ def _clear_host(args: argparse.Namespace) -> int:
                 slots.append(slot)
             else:
                 print(f"{name}: no host-mode shaping found")
+        if not args.dry_run:
+            for name in names:
+                if name in vmhook.load():
+                    require_root()
+                    vmhook.forget(name)
+                    print(f"{name}: no longer re-applied when the VM starts")
         if not slots:
             return 0
     if not slots:

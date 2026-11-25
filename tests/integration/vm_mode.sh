@@ -106,6 +106,25 @@ ws clear-vm testvm testvm2 > /dev/null
 ip link show type ifb | grep -q wsh && fail "IFBs left after clearing two VMs"
 echo "ok   two VMs in one command, cleared together"
 
+# --persist and the libvirt hook (#3), with the hook called as libvirt would.
+export WANSHAPE_VM_CONFIG="$WORK/vms.json" WANSHAPE_LIBVIRT_HOOKS="$WORK/hooks"
+ws install-vm-hook > /dev/null
+[ -x "$WORK/hooks/qemu.d/wanshape" ] || fail "hook not installed"
+ws apply-vm testvm --delay 15ms --persist > /dev/null 2>&1
+grep -q '"testvm"' "$WORK/vms.json" || fail "--persist recorded nothing"
+ip tuntap add vnet9 mode tap                    # the VM "restarted" on a new tap
+ip link set vnet9 up
+printf '<domain><devices><interface><mac address="%s"/><target dev="vnet9"/></interface></devices></domain>' "$MAC" \
+    | "$WORK/hooks/qemu.d/wanshape" testvm started begin - 2> "$WORK/hook.log"
+ws status | grep -q "testvm: vm mode, device=vnet9" || { cat "$WORK/hook.log"; fail "hook did not re-apply"; }
+tc filter show dev vnet9 egress | grep -q matchall || fail "no filter on the new tap"
+ip link del vnet9
+"$WORK/hooks/qemu.d/wanshape" testvm release end - < /dev/null 2>> "$WORK/hook.log"
+ip link show type ifb | grep -q wsh && fail "release left the IFBs"
+ws clear-vm testvm > /dev/null
+grep -q '"testvm"' "$WORK/vms.json" && fail "clear-vm did not forget the VM"
+echo "ok   --persist and the libvirt hook re-apply after a restart"
+
 # A VM restart recreates the tap under a new name: the old target goes stale.
 ws apply-vm testvm --delay 20ms > /dev/null
 ip link del vnet0

@@ -176,7 +176,7 @@ sudo ./bin/wanshape clear-vm freepbx
 `--direction egress` is the VM's upload (what it sends), `ingress` its download. It uses the same engine as host mode: the VM's tap gets a `clsact` qdisc and a pair of IFBs, its root qdisc is untouched, and the state is kept in the kernel.
 
 - **Supported:** `network` and `bridge` interfaces (and `ethernet`), which use a tap device. **Not yet:** `direct` (macvtap) interfaces, which are refused until the direction of their tc hooks is measured, and `user`/passt networking (no host device; use `apply-host --ports` for the ports it forwards).
-- **A VM restart loses the shaping**, because libvirt recreates the tap, often under a new name. `status` marks the target STALE; run `apply-vm` again.
+- **A VM restart loses the shaping**, because libvirt recreates the tap, often under a new name. `status` marks the target STALE; run `apply-vm` again, or let wanshape do it: `apply-vm --persist` records the VM's settings in `/etc/wanshape/vms.json`, and a libvirt hook installed once with `sudo wanshape install-vm-hook` (then restart `virtqemud` or `libvirtd`) re-applies them whenever libvirt starts the VM. `clear-vm` forgets them; `uninstall-vm-hook` removes the hook.
 - If the VM's interface has a libvirt `<bandwidth><outbound>` limit, libvirt has put an `ingress` qdisc on the tap that can't coexist with `clsact`, and wanshape refuses (exit 4).
 
 ## Exit codes
