@@ -17,6 +17,9 @@ ws() { python3 -m wanshape.cli "$@"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 cleanup() {
+    # Dependents first: ws-it-s shares ws-it-a's network namespace.
+    podman rm -f -t 0 ws-it-s ws-it-q1 ws-it-q2 > /dev/null 2>&1 || true
+    podman pod rm -f ws-it-pod > /dev/null 2>&1 || true
     podman rm -f -t 0 ws-it-a ws-it-b ws-it-p ws-it-k > /dev/null 2>&1 || true
     podman network rm ws-it > /dev/null 2>&1 || true
     [ -n "${ECHO:-}" ] && kill "$ECHO" 2> /dev/null || true
@@ -90,6 +93,27 @@ podman rm -f -t 0 ws-it-b > /dev/null
 ws status --prune 2>&1 | grep -q "pruned ws-it-b: container is gone" || fail "prune"
 ws status 2>&1 | grep -q "ws-it-b" && fail "pruned entry still listed"
 echo "ok   status --prune forgets a removed container"
+run ws-it-b --network ws-it                     # the probe client again
+
+echo "# shared network namespaces"
+podman run -d --init --name ws-it-s --network container:ws-it-a "$IMAGE" sleep 600 > /dev/null
+ws apply ws-it-s --delay 30ms 2>&1 >/dev/null | grep -q "shares its network namespace with ws-it-a" \
+    || fail "no warning for --network container:"
+expect "shaping ws-it-s shapes ws-it-a" ws-it-b "$A_IP" 9999 55 90
+ws status ws-it-a | grep -q "egress=on ingress=on" || fail "status via the other member"
+[ "$(ws status | grep -c 'profile=')" -eq 1 ] || fail "shared namespace listed twice"
+ws clear ws-it-a > /dev/null
+expect "cleared through the other member" ws-it-b "$A_IP" 9999 0 10
+[ "$(ws status)" = "no wanshape state found" ] || fail "state left after clearing a member"
+podman rm -f -t 0 ws-it-s > /dev/null
+podman pod create --name ws-it-pod --network ws-it > /dev/null
+# Pod members share one namespace, so only one of them can bind the echo port.
+run ws-it-q1 --pod ws-it-pod
+podman run -d --init --name ws-it-q2 --pod ws-it-pod "$IMAGE" sleep 600 > /dev/null
+ws apply ws-it-q1 --delay 10ms 2>&1 >/dev/null | grep -q "shares its network namespace with.*ws-it-q2" \
+    || fail "no warning for a pod"
+ws clear ws-it-q2 > /dev/null
+echo "ok   --network container: and pods: warned, one state entry, clear via any member"
 
 echo "# pasta (rootless default)"
 python3 -c "$ECHO_PY" 39999 &

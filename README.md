@@ -92,6 +92,8 @@ If one direction fails (for example the kernel has no `ifb` module, so incoming 
 
 `status` lists the containers in wanshape's state file (`~/.local/state/wanshape/state.json`). `status --all` also checks every running container you can shape, so it finds shaping applied by another user, by root, or before the state file was lost. `status --prune` forgets entries whose container was removed or recreated.
 
+Containers in a Podman pod, or started with `--network container:X`, share one network namespace: shaping one of them shapes all of them. `apply` says which other containers are affected, and the namespace has one state entry, so `status` and `clear` work through any member.
+
 With pasta (rootless Podman's default network), connections from the host to a published port on `127.0.0.1` skip the container's interface and are **not shaped**. Reach the container on a non-loopback address.
 
 ## Host mode: `apply-host`

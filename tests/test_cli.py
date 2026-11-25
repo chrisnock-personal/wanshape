@@ -45,6 +45,7 @@ class CliApplyTests(unittest.TestCase):
             mock.patch.object(cli, "save_state", side_effect=lambda s: self.state.update(s)),
             mock.patch.object(cli, "make_entry", return_value={"profile": "inline"}),
             mock.patch.object(Target, "verify", return_value=None),
+            mock.patch.object(cli, "netns_members", return_value=[]),
         ]
         for patch in self.patches:
             patch.start()
@@ -113,6 +114,7 @@ class CliReapplyTests(unittest.TestCase):
             mock.patch.object(cli, "load_state", side_effect=lambda: dict(self.state)),
             mock.patch.object(cli, "save_state", side_effect=self._save),
             mock.patch.object(Target, "verify", return_value=None),
+            mock.patch.object(cli, "netns_members", return_value=[]),
         ]
         for patch in patches:
             patch.start()
@@ -193,6 +195,7 @@ class CliRollbackTests(unittest.TestCase):
             mock.patch.object(cli, "load_state", side_effect=lambda: dict(self.state)),
             mock.patch.object(cli, "save_state", side_effect=self._save),
             mock.patch.object(Target, "verify", return_value=None),
+            mock.patch.object(cli, "netns_members", return_value=[]),
         ]
         for patch in patches:
             patch.start()
@@ -278,6 +281,50 @@ class CliStatusTests(unittest.TestCase):
                 mock.patch("sys.stdout", new_callable=io.StringIO) as out:
             cli._Commands.status(self.status_args(all=True))
         self.assertNotIn("test:", out.getvalue())
+
+
+class SharedNetnsTests(unittest.TestCase):
+    """#7: one network namespace is one shaping domain."""
+
+    def setUp(self):
+        self.backend = FakeBackend()
+        # Applied earlier to "other", a container sharing test's netns (inode 42).
+        self.state = {"other": {"id": "other", "name": "other", "netns_inode": 42,
+                                "profile": "3g", "prior_root_qdisc": "noqueue 0:",
+                                "added_clsact": True}}
+        shaped = LiveState(root_kind="netem", root_handle="5753:", clsact=True,
+                           our_filter=True, ifb=True)
+        patches = [
+            mock.patch.object(cli, "resolve", return_value=target()),
+            mock.patch.object(cli, "get_backend", return_value=self.backend),
+            mock.patch.object(cli, "inspect_live", return_value=shaped),
+            mock.patch.object(cli, "load_state", side_effect=lambda: dict(self.state)),
+            mock.patch.object(cli, "save_state", side_effect=self._save),
+            mock.patch.object(Target, "verify", return_value=None),
+            mock.patch.object(cli, "netns_members", return_value=["other"]),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def _save(self, entries):
+        self.state = entries
+
+    def test_apply_warns_and_keeps_one_entry(self):
+        with mock.patch("sys.stdout", new_callable=io.StringIO), \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            cli._Commands.apply(args(profile="4g", delay=None))
+        self.assertIn("shares its network namespace with other", err.getvalue())
+        self.assertEqual(set(self.state), {"abc"})
+        # What the first apply recorded about the interface is kept.
+        self.assertTrue(self.state["abc"]["added_clsact"])
+
+    def test_clear_via_another_member_removes_the_entry(self):
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            cli._Commands.clear(argparse.Namespace(
+                container="test", runtime=None, iface=None, direction="both", dry_run=False))
+        self.assertEqual(self.state, {})
+        self.assertIn(["tc", "qdisc", "del", "dev", "eth0", "clsact"], self.backend.commands)
 
 
 if __name__ == "__main__":

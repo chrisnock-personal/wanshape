@@ -138,3 +138,36 @@ def _resolve_iface(target: Target) -> str:
         f"cannot resolve the interface of {target.name!r} from its default route; "
         "pass --iface explicitly"
     )
+
+
+def netns_members(target: Target) -> list[str]:
+    """Other running containers of the same runtime that share the target's netns.
+
+    Pods and `--network container:X` share one network namespace, so shaping
+    one container shapes all of them.
+    """
+    try:
+        ids = subprocess.run([target.runtime, "ps", "-q", "--no-trunc"],
+                             text=True, capture_output=True).stdout.split()
+    except FileNotFoundError:
+        return []
+    ids = [i for i in ids if i != target.id]
+    if not ids:
+        return []
+    result = subprocess.run(
+        [target.runtime, "inspect", "--type", "container",
+         "--format", "{{.State.Pid}} {{.Name}}", *ids],
+        text=True, capture_output=True,
+    )
+    members: list[str] = []
+    for line in result.stdout.splitlines():
+        pid, _, name = line.partition(" ")
+        if not pid.isdigit() or pid == "0":
+            continue
+        try:
+            if os.stat(f"/proc/{pid}/ns/net").st_ino == target.netns_inode:
+                members.append(name.lstrip("/"))
+        except OSError:
+            continue
+    return sorted(members)
+

@@ -27,7 +27,7 @@ from .inspector import HANDLE, inspect_live, stats
 from .planner import build_apply_plan, build_clear_plan
 from .profiles import Direction, Profile, ProfileError, load_profiles
 from .state import load_state, make_entry, save_state
-from .target import Target, resolve
+from .target import Target, netns_members, resolve
 from .vm import resolve_vm
 
 EXIT_ERROR = 1
@@ -205,6 +205,10 @@ class _Commands:
         live = inspect_live(backend, target.iface)
         plan = build_apply_plan(profile, target.iface, args.direction, live, args.force)
         _print_plan(plan, backend, target)
+        members = netns_members(target)
+        if members:
+            print(f"# {target.name} shares its network namespace with {', '.join(members)}: "
+                  "they are shaped too", file=sys.stderr)
 
         if args.dry_run:
             return 0
@@ -244,7 +248,7 @@ class _Commands:
         if args.container:
             try:
                 target = resolve(args.container)
-                targets.append((target, entries.get(target.id)))
+                targets.append((target, _entry_for(entries, target)))
             except WanshapeError:
                 # Host-network containers and --ports labels live in host mode only.
                 if not inspect_host(HostBackend()).by_name(args.container):
@@ -264,6 +268,8 @@ class _Commands:
                     print(f"wanshape: {entry.get('name')}: container is gone "
                           "(`wanshape status --prune` forgets it)", file=sys.stderr)
                     continue
+                if any(t.netns_inode == target.netns_inode for t, _ in targets):
+                    continue  # another name for a namespace already listed
                 targets.append((target, entry))
             if args.all:
                 known = {t.netns_inode for t, _ in targets}
@@ -309,7 +315,7 @@ class _Commands:
     def clear(args: argparse.Namespace) -> int:
         target = resolve(args.container, args.runtime, args.iface)
         backend = get_backend(target, "auto")
-        entry = load_state().get(target.id, {})
+        entry = _entry_for(load_state(), target) or {}
         target.verify()
         live = inspect_live(backend, target.iface)
         plan = build_clear_plan(
@@ -326,7 +332,9 @@ class _Commands:
             target.verify()
             backend.run(command)
         entries = load_state()
-        entries.pop(target.id, None)
+        for key in [k for k, e in entries.items()
+                    if k == target.id or e.get("netns_inode") == target.netns_inode]:
+            entries.pop(key)
         save_state(entries)
         print(f"{target.name}: cleared; state removed")
         return 0
@@ -447,6 +455,14 @@ def _print_plan(plan, backend, target: Target) -> None:
         print("+ " + shlex.join(backend.command(command)))
 
 
+def _entry_for(entries: dict, target: Target) -> dict | None:
+    """The state entry for this container, or for another member of its netns."""
+    if target.id in entries:
+        return entries[target.id]
+    return next((e for e in entries.values()
+                 if e.get("netns_inode") == target.netns_inode), None)
+
+
 def _rollback(target: Target, backend, plan) -> None:
     """Undo a failed container apply: remove everything wanshape set on the target.
 
@@ -455,7 +471,7 @@ def _rollback(target: Target, backend, plan) -> None:
     the interface, so the clear restores the original root qdisc and clsact.
     """
     entries = load_state()
-    previous = entries.get(target.id) or {}
+    previous = _entry_for(entries, target) or {}
     same_netns = previous.get("netns_inode") == target.netns_inode
     prior = previous.get("prior_root_qdisc") if same_netns else plan.prior_root_qdisc
     added_clsact = plan.added_clsact or (same_netns and bool(previous.get("added_clsact")))
@@ -467,7 +483,9 @@ def _rollback(target: Target, backend, plan) -> None:
         return
     for command in undo.commands:
         backend.run_result(command)
-    entries.pop(target.id, None)
+    for key in [k for k, e in entries.items()
+                if k == target.id or e.get("netns_inode") == target.netns_inode]:
+        entries.pop(key)
     save_state(entries)
     print(f"wanshape: rolled back; {target.name} is not shaped "
           "(use --allow-partial to keep the direction that worked)", file=sys.stderr)
@@ -513,7 +531,11 @@ def _save_and_report(target, profile_name, direction, live, plan, partial=False)
     added_clsact = plan.added_clsact
     # Re-applying over our own shaping: what we see now is wanshape's state, not the
     # original. Keep what the first apply recorded so `clear` can still restore it.
-    previous = entries.get(target.id)
+    previous = _entry_for(entries, target)
+    # One network namespace is one shaping domain, whichever member it was applied to.
+    for key in [k for k, e in entries.items()
+                if k != target.id and e.get("netns_inode") == target.netns_inode]:
+        entries.pop(key)
     if previous and previous.get("netns_inode") == target.netns_inode:
         if live.root_handle == HANDLE:
             prior_root_qdisc = previous.get("prior_root_qdisc", prior_root_qdisc)

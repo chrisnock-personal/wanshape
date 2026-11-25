@@ -50,7 +50,7 @@ class PlannerTests(unittest.TestCase):
 
     def test_refuses_foreign_clsact(self):
         live = LiveState(root_kind="noqueue", root_handle="0:", clsact=True,
-                         our_filter=False, ifb=False)
+                         our_filter=False, ifb=False, foreign_filters=True)
         with self.assertRaises(WanshapeError):
             build_apply_plan(profile(), "eth0", "ingress", live)
         plan = build_apply_plan(profile(), "eth0", "ingress", live, force=True)
@@ -65,6 +65,19 @@ class PlannerTests(unittest.TestCase):
         # Our matchall filter can't be replaced in place (EEXIST); it is kept.
         self.assertFalse(any("mirred" in c for c in plan.ingress))
         self.assertIn("netem", plan.ingress[-1])
+
+    def test_empty_clsact_is_not_foreign(self):
+        live = LiveState(root_kind="noqueue", root_handle="0:", clsact=True,
+                         our_filter=False, ifb=False)
+        plan = build_apply_plan(profile(), "eth0", "ingress", live)
+        self.assertFalse(plan.added_clsact)
+        self.assertTrue(any("mirred" in c for c in plan.ingress))
+
+    def test_clear_without_state_removes_clsact_holding_only_ours(self):
+        live = LiveState(root_kind="netem", root_handle="5753:", clsact=True,
+                         our_filter=True, ifb=True)
+        plan = build_clear_plan("eth0", "both", live, added_clsact=False)
+        self.assertIn(["tc", "qdisc", "del", "dev", "eth0", "clsact"], plan.commands)
 
     def test_reapply_rebuilds_root_so_reordering_can_change(self):
         live = LiveState(root_kind="netem", root_handle="5753:", clsact=False,
@@ -102,7 +115,7 @@ class PlannerTests(unittest.TestCase):
 
     def test_clear_leaves_foreign_clsact_alone(self):
         live = LiveState(root_kind="noqueue", root_handle="0:", clsact=True,
-                         our_filter=False, ifb=False)
+                         our_filter=False, ifb=False, foreign_filters=True)
         plan = build_clear_plan("eth0", "both", live, False, "noqueue 0:")
         self.assertTrue(plan.empty)
 

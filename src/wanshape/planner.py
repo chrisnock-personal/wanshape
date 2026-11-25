@@ -62,7 +62,8 @@ def build_apply_plan(
             )
 
     if direction in ("ingress", "both"):
-        if (live.clsact and not live.our_filter) or (live.ifb and not live.our_filter):
+        # An empty clsact (e.g. left by a clear that had no state entry) is fine to use.
+        if live.foreign_filters or (live.ifb and not live.our_filter):
             if not force:
                 raise ConflictError(
                     f"{iface} already has foreign clsact/IFB state; use --force to replace it"
@@ -112,7 +113,8 @@ def build_clear_plan(
             plan.ingress.append(
                 ["tc", "filter", "del", "dev", iface, "ingress", "pref", FILTER_PREF]
             )
-        if live.clsact and added_clsact:
+        # Remove clsact if wanshape added it, or if nothing but our filter is on it.
+        if live.clsact and (added_clsact or not live.foreign_filters):
             plan.ingress.append(["tc", "qdisc", "del", "dev", iface, "clsact"])
         if live.ifb:
             plan.ingress.append(["ip", "link", "del", IFB])
