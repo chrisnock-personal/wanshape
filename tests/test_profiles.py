@@ -1,7 +1,9 @@
+import io
 import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from wanshape.profiles import Direction, ProfileError, load_profiles
 
@@ -58,7 +60,7 @@ class ProfileTests(unittest.TestCase):
                 else:
                     os.environ["XDG_CONFIG_HOME"] = old
 
-    def test_invalid_user_profile_fails_loudly(self):
+    def test_invalid_user_profile_is_skipped_with_a_warning(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = Path(tmp) / "wanshape"
             config.mkdir()
@@ -68,8 +70,11 @@ class ProfileTests(unittest.TestCase):
             old = os.environ.get("XDG_CONFIG_HOME")
             os.environ["XDG_CONFIG_HOME"] = tmp
             try:
-                with self.assertRaises(ProfileError):
-                    load_profiles()
+                with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+                    profiles = load_profiles()
+                self.assertNotIn("bad", profiles)
+                self.assertIn("3g", profiles)   # built-ins still load
+                self.assertIn("skipping profile 'bad'", err.getvalue())
             finally:
                 if old is None:
                     os.environ.pop("XDG_CONFIG_HOME", None)

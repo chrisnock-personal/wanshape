@@ -419,6 +419,7 @@ def load_profiles() -> dict[str, Profile]:
     data = tomllib.loads(BUILTIN_TOML)
     config = _config_home()
     user_file = config / "wanshape" / "profiles.toml"
+    user_names: set[str] = set()
     if user_file.is_file():
         with user_file.open("rb") as fh:
             user_data = tomllib.load(fh).get("profiles", {})
@@ -429,9 +430,18 @@ def load_profiles() -> dict[str, Profile]:
                       "letters, digits, '.', '_' and '-'", file=sys.stderr)
                 continue
             data.setdefault("profiles", {})[name] = raw
-    profiles = {
-        name: _profile_from(name, raw) for name, raw in data.get("profiles", {}).items()
-    }
-    for profile in profiles.values():
-        profile.validate()
+            user_names.add(name)
+    profiles: dict[str, Profile] = {}
+    for name, raw in data.get("profiles", {}).items():
+        try:
+            profile = _profile_from(name, raw)
+            profile.validate()
+        except ProfileError as exc:
+            if name not in user_names:
+                raise   # a built-in must be valid
+            # A bad user profile is skipped, not fatal for every command.
+            print(f"wanshape: skipping profile {name!r} in {user_file}: {exc}",
+                  file=sys.stderr)
+            continue
+        profiles[name] = profile
     return profiles

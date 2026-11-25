@@ -105,11 +105,14 @@ class PlannerTests(unittest.TestCase):
         self.assertFalse(plan.added_clsact)
         self.assertTrue(any("mirred" in c for c in plan.ingress))
 
-    def test_clear_without_state_removes_clsact_holding_only_ours(self):
+    def test_clear_keeps_a_clsact_wanshape_didnt_add(self):
+        """It may be another tool's, empty until it attaches filters."""
         live = LiveState(root_kind="netem", root_handle="5753:", clsact=True,
                          our_filter=True, ifb=True)
         plan = build_clear_plan("eth0", "both", live, added_clsact=False)
-        self.assertIn(["tc", "qdisc", "del", "dev", "eth0", "clsact"], plan.commands)
+        self.assertNotIn(["tc", "qdisc", "del", "dev", "eth0", "clsact"], plan.commands)
+        self.assertIn(["tc", "filter", "del", "dev", "eth0", "ingress", "pref", "49152"],
+                      plan.commands)
 
     def test_reapply_rebuilds_root_so_reordering_can_change(self):
         live = LiveState(root_kind="netem", root_handle="5753:", clsact=False,

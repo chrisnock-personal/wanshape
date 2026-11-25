@@ -413,6 +413,7 @@ def resolve_host_iface(backend, iface: str | None = None, via: str | None = None
 class HostPlan:
     slot: HostSlot
     commands: list[Command] = field(default_factory=list)
+    replaces: bool = False   # the plan first removes earlier shaping (re-apply, takeover)
 
 
 def build_host_apply(
@@ -513,6 +514,9 @@ def build_host_apply(
         commands += build_host_clear(existing, live, keep_clsact=same_iface)
         slot_no = existing.slot
         added_clsact = existing.added_clsact if same_iface else False
+    elif stale_here:
+        slot_no = stale_here[0].slot   # take over the stale VM's slot, not a new one
+        added_clsact = False
     else:
         slot_no = _free_slot(live, iface)
         added_clsact = False
@@ -558,7 +562,8 @@ def build_host_apply(
         fresh.append(["tc", "filter", "add", "dev", iface, hook, "pref", str(pref),
                       *match, "action", "mirred", "egress", "redirect", "dev", ifb])
 
-    return HostPlan(slot=slot, commands=commands + fresh)
+    return HostPlan(slot=slot, commands=commands + fresh,
+                    replaces=bool(existing or stale_here))
 
 
 def _legacy_band(slot: HostSlot, state: IfaceState) -> bool:

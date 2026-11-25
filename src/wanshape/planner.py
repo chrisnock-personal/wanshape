@@ -122,9 +122,9 @@ def build_clear_plan(
 ) -> Plan:
     """Commands that remove wanshape's shaping from a container interface.
 
-    `added_clsact` is only recorded on the plan: whether clsact is removed
-    depends on the live state alone (removed when nothing but wanshape's
-    filter is on it), because another tool may have added filters since.
+    clsact is removed only when wanshape added it (`added_clsact`, from the
+    state file) and nothing but wanshape's filter is on it now: an empty
+    clsact may belong to another tool that attaches its filters later.
     """
     if direction not in ("egress", "ingress", "both"):
         raise WanshapeError(f"invalid direction {direction!r}")
@@ -139,9 +139,9 @@ def build_clear_plan(
             plan.ingress.append(
                 ["tc", "filter", "del", "dev", iface, "ingress", "pref", FILTER_PREF]
             )
-        # Remove clsact only when nothing but our filter is on it, even if wanshape
-        # added it: another tool may have put filters there since.
-        if live.clsact and not live.foreign_filters:
+        # Remove clsact only if wanshape added it and nothing but our filter is
+        # on it: another tool may have put filters there since, or own it empty.
+        if live.clsact and added_clsact and not live.foreign_filters:
             plan.ingress.append(["tc", "qdisc", "del", "dev", iface, "clsact"])
         if live.ifb:
             plan.ingress.append(["ip", "link", "del", IFB])

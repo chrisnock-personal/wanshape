@@ -63,7 +63,7 @@ More netem options, as CLI flags (inline settings) or profile fields:
 
 `--rate-mode accurate` exists because tc-netem(8) warns that netem's own rate is affected by timer granularity. On Fedora's 7.3 kernel the two measured the same (TCP 3.76 vs 3.77 mbit/s at a 4 mbit/s cap, identical UDP loss and jitter), so it's opt-in, for kernels or VMs with coarser timers.
 
-Your own profiles go in `~/.config/wanshape/profiles.toml` and are added to the built-ins (or override them). Under `sudo`, wanshape reads the invoking user's file. Profile names use letters, digits, `.`, `_` and `-`:
+Your own profiles go in `~/.config/wanshape/profiles.toml` and are added to the built-ins (or override them). Under `sudo`, wanshape reads the invoking user's file. Profile names use letters, digits, `.`, `_` and `-`; quote a name with a dot (`[profiles."lte.v2".up]`), or TOML reads it as nested tables. A profile wanshape can't read is skipped with a warning:
 
 ```toml
 [profiles.my-sip]

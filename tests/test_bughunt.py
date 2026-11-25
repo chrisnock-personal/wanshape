@@ -125,7 +125,8 @@ class TimerUnitTests(unittest.TestCase):
                                       load_profiles()["3g"], 300)
         self.assertTrue(ok)
         clear_args = schedule.call_args[0][2]
-        self.assertEqual(clear_args[-4:], ["--iface", "eth1", "--only-netns", "99"])
+        self.assertEqual(clear_args[-6:], ["--iface", "eth1", "--only-netns", "99",
+                                           "--only-pid", "1"])
 
     def test_unit_names_have_no_dots_and_dont_collide(self):
         self.assertNotIn(".", timer.unit_name("vm", "web.service"))
@@ -430,6 +431,62 @@ class ThirdReviewTests(unittest.TestCase):
                              live)
         live.ifaces["eth0"].egress_prefs = {50300}   # re-applied: now in the remote band
         build_host_apply("b", load_profiles()["3g"], parse_ports("5060"), "eth0", "both", live)
+
+
+class FourthReviewTests(unittest.TestCase):
+    def test_timer_clear_checks_the_pid_too(self):
+        """A restarted container can get the same namespace inode back."""
+        a = argparse.Namespace(container=["web"], runtime=None, iface=None, direction="both",
+                               dry_run=False, only_netns=42, only_pid=999)
+        with mock.patch.object(cli, "resolve", return_value=target()), \
+                mock.patch.object(cli, "_clear_container") as clear, \
+                mock.patch("sys.stdout", new_callable=io.StringIO):
+            cli._Commands.clear(a)
+        clear.assert_not_called()
+        a.only_pid = 1   # same container, not restarted
+        with mock.patch.object(cli, "resolve", return_value=target()), \
+                mock.patch.object(cli, "_clear_container") as clear:
+            cli._Commands.clear(a)
+        clear.assert_called_once()
+
+    def test_takeover_reuses_the_stale_slot_when_all_are_busy(self):
+        slots = {n: HostSlot(n, f"t{n}", "3g", f"vnet{n}", [], "both", True, kind="vm",
+                             mac=f"52:54:00:00:00:{n:02x}") for n in range(10)}
+        live = HostLive(slots=slots, ifbs={f"wsh{n}{d}" for n in range(10) for d in ("up", "dn")},
+                        ifaces={f"vnet{n}": IfaceState(clsact=True) for n in range(10)})
+        plan = build_host_apply("newvm", load_profiles()["3g"], [], "vnet4", "both", live,
+                                kind="vm", mac="52:54:00:00:00:ff")
+        self.assertEqual(plan.slot.slot, 4)
+        self.assertTrue(plan.replaces)
+
+    def test_failed_reapply_says_it_is_now_unshaped(self):
+        old = HostSlot(0, "sip", "3g", "eth0", parse_ports("5060"), "both", True)
+        live = HostLive(slots={0: old}, ifbs={"wsh0up", "wsh0dn"},
+                        ifaces={"eth0": IfaceState(clsact=True)})
+        plan = build_host_apply("sip", load_profiles()["4g"], parse_ports("5060"), "eth0",
+                                "both", live)
+        a = argparse.Namespace(keep_going=False, direction="both")
+        with mock.patch.object(cli, "run_plan", side_effect=CommandError(["tc"], 2, "x")), \
+                mock.patch.object(cli, "require_root"), \
+                mock.patch.object(cli, "_tidy_clsact"), \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            cli._run_host_plans(FakeBackend(), [("sip", plan)], a, load_profiles()["4g"], None)
+        self.assertIn("now unshaped", err.getvalue())
+
+    def test_unquoted_dotted_profile_name_is_skipped(self):
+        import os
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as cfg:
+            (Path(cfg) / "wanshape").mkdir()
+            (Path(cfg) / "wanshape" / "profiles.toml").write_text(
+                '[profiles.lte.v2.up]\ndelay = "5ms"\n[profiles."lte.v3".up]\ndelay = "6ms"\n')
+            with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": cfg}), \
+                    mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+                profiles = load_profiles()
+        self.assertIn("lte.v3", profiles)
+        self.assertNotIn("lte", profiles)
+        self.assertIn("skipping profile 'lte'", err.getvalue())
 
 
 if __name__ == "__main__":

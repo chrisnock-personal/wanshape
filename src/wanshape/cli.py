@@ -131,6 +131,7 @@ def _parser() -> argparse.ArgumentParser:
     clear.add_argument("--iface")
     clear.add_argument("--dry-run", action="store_true")
     clear.add_argument("--only-netns", type=int, help=argparse.SUPPRESS)   # used by timers
+    clear.add_argument("--only-pid", type=int, help=argparse.SUPPRESS)     # used by timers
     return parser
 
 
@@ -365,7 +366,11 @@ class _Commands:
         targets = [resolve(name, args.runtime, args.iface) for name in _names(args.container)]
         for target in targets:
             only = getattr(args, "only_netns", None)
-            if only is not None and only != target.netns_inode:
+            only_pid = getattr(args, "only_pid", None)
+            # The kernel can hand a restarted container the same namespace inode;
+            # its main PID changes, so both have to match.
+            if (only is not None and only != target.netns_inode) or (
+                    only_pid is not None and only_pid != target.pid):
                 # A --duration timer from before the container was restarted: its
                 # shaping went with the old namespace; leave the new one alone.
                 print(f"{target.name}: restarted since this timer was set; nothing to clear")
@@ -447,7 +452,8 @@ def _apply_container(prep, args: argparse.Namespace, profile: Profile,
         if seconds:
             timer.schedule(unit, seconds, ["clear", target.id, "--runtime", target.runtime,
                                            "--iface", target.iface,
-                                           "--only-netns", str(target.netns_inode)])
+                                           "--only-netns", str(target.netns_inode),
+                                           "--only-pid", str(target.pid)])
         else:
             timer.cancel(unit)
     except WanshapeError as exc:
@@ -530,9 +536,11 @@ def _run_host_plans(backend, plans, args: argparse.Namespace, profile: Profile,
                 except WanshapeError as cleanup:
                     cleaned = False
                     print(f"wanshape: {name}: clean-up: {cleanup}", file=sys.stderr)
-            print(f"wanshape: {name}: failed and was "
-                  + ("rolled back" if cleaned else "only partly rolled back; check "
-                     "`wanshape status`") + f": {error}", file=sys.stderr)
+            what = ("rolled back" if cleaned else
+                    "only partly rolled back; check `wanshape status`")
+            if plan.replaces:
+                what += "; its earlier shaping had already been removed, so it is now unshaped"
+            print(f"wanshape: {name}: failed and was {what}: {error}", file=sys.stderr)
             failed.append(name)
             if not args.keep_going:
                 for done_name, done_plan in reversed(done):
