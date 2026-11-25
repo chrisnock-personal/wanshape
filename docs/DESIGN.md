@@ -84,7 +84,7 @@ tap ingress (from the guest, its upload)  -> wsh<N>up
 tap egress  (to the guest, its download)  -> wsh<N>dn
 ```
 
-The tap comes from `virsh domiflist` and must carry the MAC libvirt gives a guest's tap (`fe:` + the guest's MAC), so a reused `vnetN` name can't redirect the shaping. `direct` (macvtap) interfaces are refused until their hooks are measured (#1); `user`/passt has no host device (use host mode).
+The device comes from `virsh domiflist` and must carry the VM's MAC (`fe:` + the guest's MAC for a tap, the guest's MAC itself for macvtap), so a reused `vnetN`/`macvtapN` name can't redirect the shaping. A `direct` interface's macvtap device has its hooks the other way round from a tap (measured), like a container's interface, and the slot records `dev=macvtap`. `user`/passt has no host device (use host mode).
 
 ### 4.4 The netem tree (all modes)
 
@@ -120,7 +120,7 @@ The tap comes from `virsh domiflist` and must carry the MAC libvirt gives a gues
 
 ## 9. Open work
 
-Tracked as GitHub issues: macvtap VMs (#1), VM-to-VM measurement (#2), re-apply after a VM restart (#3), Docker and the sidecar backend (#4), host and VM `--duration` under sudo on a second machine (#5), PyPI publishing (#14).
+Tracked as GitHub issues: measuring the delay on a VM's new device after a real restart with the libvirt hook (#3; the re-apply itself was confirmed on libvirt in WSL2), PyPI publishing (#14). Decided against: the sidecar backend (#4), since root already covers rootful runtimes. Macvtap VMs (#1), VM-to-VM traffic (#2), `--duration` as root (#5) and Docker (#4, in CI) are done and measured.
 
 ## 10. Revision history
 
