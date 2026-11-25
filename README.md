@@ -204,3 +204,7 @@ sh tools/measure-profiles.sh [profile ...]  # what each profile does to an RTP-l
 ```
 
 The integration tests measure real round-trip times with and without shaping, and check that everything is removed afterwards. CI runs all of them on GitHub Actions (`.github/workflows/ci.yml`).
+
+## License
+
+MIT. See [LICENSE](LICENSE).
