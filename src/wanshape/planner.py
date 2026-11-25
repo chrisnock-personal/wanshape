@@ -120,6 +120,12 @@ def build_clear_plan(
     added_clsact: bool = False,
     prior_root_qdisc: str | None = None,
 ) -> Plan:
+    """Commands that remove wanshape's shaping from a container interface.
+
+    `added_clsact` is only recorded on the plan: whether clsact is removed
+    depends on the live state alone (removed when nothing but wanshape's
+    filter is on it), because another tool may have added filters since.
+    """
     if direction not in ("egress", "ingress", "both"):
         raise WanshapeError(f"invalid direction {direction!r}")
     plan = Plan(added_clsact=added_clsact)

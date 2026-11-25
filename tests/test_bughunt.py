@@ -61,15 +61,36 @@ class OverlapTests(unittest.TestCase):
     """2: local against remote ports; different peers never clash."""
 
     def live_with(self, **kw):
-        other = HostSlot(0, "a", "3g", "eth0", [], "both", True, **kw)
+        ports = kw.pop("ports", [])
+        other = HostSlot(0, "a", "3g", "eth0", ports, "both", True, **kw)
         return HostLive(slots={0: other}, ifbs={"wsh0up", "wsh0dn"},
                         ifaces={"eth0": IfaceState(clsact=True)})
 
-    def test_local_against_remote(self):
+    def test_local_port_beats_another_targets_remote_port(self):
+        """Second review: local-vs-remote is settled by precedence, not refused."""
         live = self.live_with(remote_ports=parse_ports("5060"))
+        plan = build_host_apply("b", load_profiles()["3g"], parse_ports("6000"), "eth0", "both",
+                                live)
+        local_prefs = [int(c[7]) for c in plan.commands if c[:3] == ["tc", "filter", "add"]]
+        # Target a's remote-port filters sit in the band above every local-port one.
+        self.assertTrue(all(p < host.REMOTE_PREF_BASE for p in local_prefs))
+        remote_plan = build_host_apply("c", load_profiles()["3g"], [], "eth0", "both",
+                                       HostLive(), remote_ports=parse_ports("5060"))
+        remote_prefs = [int(c[7]) for c in remote_plan.commands
+                        if c[:3] == ["tc", "filter", "add"]]
+        self.assertTrue(all(p >= host.REMOTE_PREF_BASE for p in remote_prefs))
+
+    def test_overlapping_remote_ports_and_peer_only_still_refused(self):
+        live = self.live_with(remote_ports=parse_ports("8000-9000"))
         with self.assertRaises(ConflictError):
-            build_host_apply("b", load_profiles()["3g"], parse_ports("5060"), "eth0", "both",
-                             live)
+            build_host_apply("b", load_profiles()["3g"], [], "eth0", "both", live,
+                             remote_ports=parse_ports("8088"))
+        with self.assertRaises(ConflictError):   # peer-only vs a remote-side target
+            build_host_apply("b", load_profiles()["3g"], [], "eth0", "both", live,
+                             peer="10.0.0.1")
+        local = self.live_with(ports=parse_ports("5060"))
+        build_host_apply("b", load_profiles()["3g"], [], "eth0", "both", local,
+                         peer="10.0.0.1")   # peer-only vs local ports: precedence
 
     def test_different_peers_are_fine(self):
         live = self.live_with(peer="10.0.0.1")
@@ -172,6 +193,15 @@ class NameTests(unittest.TestCase):
 
 
 class StaleVmTests(unittest.TestCase):
+    def test_takeover_keeps_the_clsact_record(self):
+        old = HostSlot(0, "vm-a", "3g", "vnet0", [], "both", True, kind="vm",
+                       mac="52:54:00:00:00:0a")
+        live = HostLive(slots={0: old}, ifbs={"wsh0up", "wsh0dn"},
+                        ifaces={"vnet0": IfaceState(clsact=True)})
+        plan = build_host_apply("vm-b", load_profiles()["3g"], [], "vnet0", "both", live,
+                                kind="vm", mac="52:54:00:00:00:0b")
+        self.assertTrue(plan.slot.added_clsact)
+
     def test_tap_name_reused_by_another_vm_is_taken_over(self):
         old = HostSlot(0, "vm-a", "3g", "vnet0", [], "both", True, kind="vm",
                        mac="52:54:00:00:00:0a")
@@ -304,6 +334,53 @@ class ClearVmByUuidTests(unittest.TestCase):
             cli._clear_host(a)
         canon.assert_called_once_with("3f2a-uuid", "qemu:///system")
         self.assertIn("ip link del wsh0up", out.getvalue())
+
+
+class HookLockTests(unittest.TestCase):
+    def test_hook_ignores_other_vms_without_the_lock(self):
+        a = argparse.Namespace(hook_args=["other-vm", "started", "begin", "-"])
+        with mock.patch.object(cli.vmhook, "load", return_value={}), \
+                mock.patch.object(cli, "host_lock") as lock, \
+                mock.patch("sys.stdin", new_callable=io.StringIO):
+            self.assertEqual(cli._vm_hook(a), 0)
+        lock.assert_not_called()
+
+    def test_hook_ignores_operations_it_doesnt_act_on(self):
+        a = argparse.Namespace(hook_args=["web", "prepare", "begin", "-"])
+        with mock.patch.object(cli.vmhook, "load", return_value={"web": {}}), \
+                mock.patch.object(cli, "host_lock") as lock, \
+                mock.patch("sys.stdin", new_callable=io.StringIO):
+            self.assertEqual(cli._vm_hook(a), 0)
+        lock.assert_not_called()
+
+
+class CleanupFailureTests(unittest.TestCase):
+    def test_undo_errors_dont_stop_the_bookkeeping(self):
+        plans = []
+        live = HostLive()
+        for name, port in (("a", "6000"), ("b", "6001")):
+            plan = build_host_apply(name, load_profiles()["3g"], parse_ports(port), "eth0",
+                                    "both", live)
+            cli._simulate(live, plan)
+            plans.append((name, plan))
+        backend = FakeBackend()
+
+        def run_plan(b, commands):
+            if any("wsh1up" in c for c in commands):
+                raise CommandError(["tc"], 2, "boom")
+        a = argparse.Namespace(keep_going=False, direction="both")
+        with mock.patch.object(cli, "run_plan", side_effect=run_plan), \
+                mock.patch.object(cli, "require_root"), \
+                mock.patch.object(cli, "_host_timer"), \
+                mock.patch.object(cli, "_undo_host_target",
+                                  side_effect=WanshapeError("device vanished")) as undo, \
+                mock.patch.object(cli, "_tidy_clsact"), \
+                mock.patch("sys.stdout", new_callable=io.StringIO), \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            code = cli._run_host_plans(backend, plans, a, load_profiles()["3g"], None)
+        self.assertEqual(code, 1)
+        self.assertEqual([c.args[1] for c in undo.call_args_list], ["b", "a"])
+        self.assertIn("could not undo", err.getvalue())
 
 
 if __name__ == "__main__":

@@ -499,14 +499,22 @@ def _run_host_plans(backend, plans, args: argparse.Namespace, profile: Profile,
             run_plan(backend, plan.commands)
             _host_timer(plan.slot.kind, name, seconds)
         except WanshapeError as exc:
-            _undo_host_target(backend, name)   # e.g. the timer couldn't be scheduled
-            if plan.slot.added_clsact:   # only a clsact wanshape added or co-owned
-                _tidy_clsact(backend, plan.slot.iface)
+            try:
+                _undo_host_target(backend, name)   # e.g. the timer couldn't be scheduled
+                if plan.slot.added_clsact:   # only a clsact wanshape added or co-owned
+                    _tidy_clsact(backend, plan.slot.iface)
+            except WanshapeError as cleanup:   # keep going: the others still need undoing
+                print(f"wanshape: {name}: clean-up after the failure: {cleanup}",
+                      file=sys.stderr)
             print(f"wanshape: {name}: failed and was rolled back: {exc}", file=sys.stderr)
             failed.append(name)
             if not args.keep_going:
                 for done_name, done_plan in reversed(done):
-                    _undo_host_target(backend, done_name)
+                    try:
+                        _undo_host_target(backend, done_name)
+                    except WanshapeError as cleanup:
+                        print(f"wanshape: {done_name}: could not undo: {cleanup}",
+                              file=sys.stderr)
                     timer.cancel(timer.unit_name(done_plan.slot.kind, done_name))
                     print(f"wanshape: {done_name}: undone (use --keep-going to keep "
                           "the targets that worked)", file=sys.stderr)
@@ -639,6 +647,9 @@ def _vm_hook(args: argparse.Namespace) -> int:
                 for command in build_host_clear(slot, live):
                     backend.run_result(command)
 
+        acts = (operation, sub_operation) in (("started", "begin"), ("release", "end"))
+        if not acts or domain not in vmhook.load():
+            return 0   # nothing to do: don't wait for the lock at all
         # Wait at most 30 s for a running wanshape command: never block a VM start.
         with host_lock(timeout=30):
             done = vmhook.run_hook(domain, operation, sub_operation, xml_text, apply_fn,

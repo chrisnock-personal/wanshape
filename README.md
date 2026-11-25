@@ -156,7 +156,7 @@ Things to know:
 - **`--peer ADDRESS` limits everything to one remote host**, such as the PBX. On its own (no ports) it shapes all traffic with that host, which is the simplest way to put one leg of a call on a bad network.
 - **Loopback isn't shaped.** Traffic between processes on the same host never reaches the interface.
 - **One interface per target.** Pick the one that carries the traffic you care about, for example with `--via <peer address>`.
-- Up to 10 host and VM targets at once. Two targets that could match the same packets on one interface (overlapping local or remote ports, unless they're limited to different peers) are refused. Host and VM changes take a lock, so two runs at once (or two VMs starting together) don't collide.
+- Up to 10 host and VM targets at once. Two targets on one interface with overlapping local ports, or overlapping remote ports, are refused (unless they're limited to different peers). A packet from one target's local port is that target's, even if it also matches another target's remote port: local-port filters always run first. Host and VM changes take a lock, so two runs at once (or two VMs starting together) don't collide.
 - wanshape adds a `clsact` qdisc to the interface if there isn't one and removes it when the last host target is cleared, unless another tool has filters there.
 - Host mode keeps no state file. Each target's settings are stored in the alias of its `wsh<N>up` IFB device, so `status` and `clear-host` read them from the kernel.
 

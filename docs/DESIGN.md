@@ -73,7 +73,7 @@ Matches, per IP family (IPv4 and IPv6) and protocol (UDP and TCP):
 - **remote ports** (`--remote-ports`, a `wanshape.remote_ports` label): `dst_port` out, `src_port` in, for clients on random local ports;
 - **peer** (`--peer`): `dst_ip` out, `src_ip` in, limiting the other matches to one host and one family; on its own it matches all traffic with that host.
 
-Each target takes a slot N (0-9): filter prefs `49300 + 100*N` upwards on both hooks. Overlapping targets on one interface are refused. `clsact` ownership is shared, so whichever wanshape target is cleared last removes it, unless another tool's filters remain. An interface with a plain `ingress` qdisc (libvirt `<bandwidth><outbound>`) is refused: it can't coexist with `clsact`. Under sudo, rootless containers are inspected as `SUDO_USER`.
+Each target takes a slot N (0-9): local-port (and VM) filters use prefs `49300 + 100*N` upwards on both hooks, remote-port and peer-only filters `50300 + 100*N` upwards, so a packet from one target's local port is always that target's even if it also matches another's remote port. Ambiguous pairs on one interface are refused: overlapping local ports, overlapping remote ports, or a peer-only target against another remote-side one, unless they're limited to different peers. `clsact` ownership is shared, so whichever wanshape target is cleared last removes it, unless another tool's filters remain. An interface with a plain `ingress` qdisc (libvirt `<bandwidth><outbound>`) is refused: it can't coexist with `clsact`. Under sudo, rootless containers are inspected as `SUDO_USER`.
 
 ### 4.3 VM mode (`apply-vm`)
 
@@ -102,7 +102,7 @@ The tap comes from `virsh domiflist` and must carry the MAC libvirt gives a gues
 
 - Resolve, plan and validate **every** target in a command before changing anything; with several targets, undo the ones done if a later one fails (unless `--keep-going`).
 - Re-check the namespace inode before each change.
-- Host and VM changes (apply, clear, the libvirt hook) hold a lock (`/run/lock/wanshape.lock`), so two runs can't plan against the same free slot.
+- Host and VM changes (apply, clear, the libvirt hook) hold a lock (`/run/wanshape/lock`, in a root-owned 0700 directory; `WANSHAPE_LOCK_DIR` overrides it for tests), so two runs can't plan against the same free slot. The libvirt hook waits at most 30 s for it, and only for VMs and operations it acts on.
 - A failed apply undoes only what that run created, never a device or filter that was already there.
 - Never replace another tool's root qdisc, `clsact` filters or IFB without `--force` (container mode); never touch another tool's filters in host or VM mode.
 - Roll back a failed apply.

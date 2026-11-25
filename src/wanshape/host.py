@@ -237,9 +237,14 @@ class HostSlot:
             parts.append(f"peer={self.peer}")
         return " ".join(parts)
 
-    def filters(self) -> list[tuple[str, list[str], str]]:
-        """(hook, match arguments, IFB) for each filter this target needs."""
-        result: list[tuple[str, list[str], str]] = []
+    def filters(self) -> list[tuple[str, list[str], str, bool]]:
+        """(hook, match arguments, IFB, remote) for each filter this target needs.
+
+        `remote` filters (remote ports, a peer on its own) get prefs in a band
+        above every local-port filter, so a packet from one target's local port
+        is always that target's, even if it also matches another's remote port.
+        """
+        result: list[tuple[str, list[str], str, bool]] = []
         if self.kind == "vm":
             # Tap: ingress = from the guest (up), egress = to the guest (down).
             # Macvtap: the other way round, like a container's own interface.
@@ -248,7 +253,7 @@ class HostSlot:
                      (("egress", "egress", self.up), ("ingress", "ingress", self.down)))
             for want, hook, ifb in hooks:
                 if self.direction in (want, "both"):
-                    result.append((hook, ["protocol", "all", "matchall"], ifb))
+                    result.append((hook, ["protocol", "all", "matchall"], ifb, False))
             return result
         families = ("ip", "ipv6")
         if self.peer:
@@ -261,21 +266,29 @@ class HostSlot:
             if self.direction not in (hook, "both"):
                 continue
             peer = [ip_key, self.peer] if self.peer else []
-            matches = ([(local_key, r) for r in self.ports]
-                       + [(remote_key, r) for r in self.remote_ports])
+            matches = ([(local_key, r, False) for r in self.ports]
+                       + [(remote_key, r, True) for r in self.remote_ports])
             for proto in families:
                 if not matches:  # peer only: everything with that host
-                    result.append((hook, ["protocol", proto, "flower", *peer], ifb))
-                for key, r in matches:
+                    result.append((hook, ["protocol", proto, "flower", *peer], ifb, True))
+                for key, r, remote in matches:
                     for ip_proto in ("udp", "tcp"):
                         result.append((hook, ["protocol", proto, "flower", "ip_proto",
-                                              ip_proto, *peer, key, str(r)], ifb))
+                                              ip_proto, *peer, key, str(r)], ifb, remote))
         return result
 
 
-def slot_prefs(slot: int) -> range:
-    start = PREF_BASE + slot * PREFS_PER_SLOT
+REMOTE_PREF_BASE = PREF_BASE + MAX_SLOTS * PREFS_PER_SLOT   # 50300
+
+
+def slot_prefs(slot: int, remote: bool = False) -> range:
+    """A slot's prefs: local-port (and VM) filters, or the remote band above them all."""
+    start = (REMOTE_PREF_BASE if remote else PREF_BASE) + slot * PREFS_PER_SLOT
     return range(start, start + PREFS_PER_SLOT)
+
+
+def all_slot_prefs(slot: int) -> set[int]:
+    return set(slot_prefs(slot)) | set(slot_prefs(slot, remote=True))
 
 
 def parse_alias(slot: int, alias: str) -> HostSlot | None:
@@ -318,7 +331,7 @@ class IfaceState:
         return self.egress_prefs if hook == "egress" else self.ingress_prefs
 
     def foreign_filters(self) -> bool:
-        ours = range(PREF_BASE, PREF_BASE + MAX_SLOTS * PREFS_PER_SLOT)
+        ours = range(PREF_BASE, REMOTE_PREF_BASE + MAX_SLOTS * PREFS_PER_SLOT)
         return any(p not in ours for p in self.egress_prefs | self.ingress_prefs)
 
 
@@ -400,7 +413,6 @@ def resolve_host_iface(backend, iface: str | None = None, via: str | None = None
 class HostPlan:
     slot: HostSlot
     commands: list[Command] = field(default_factory=list)
-    rollback: list[Command] = field(default_factory=list)
 
 
 def build_host_apply(
@@ -453,13 +465,18 @@ def build_host_apply(
             )
         clash: list[str] = []
         if not peer or not other.peer or peer == other.peer:
-            # Different peers can never match the same packet; otherwise any pair of
-            # port sets can: local against local, remote against remote, and local
-            # against remote (a packet from port 5060 to port 5060 matches both).
-            mine = ports + remote_ports
-            theirs = other.ports + other.remote_ports
-            clash += [f"{a}/{b}" for a in mine for b in theirs if a.overlaps(b)]
-            if not mine or not theirs:
+            # Different peers can never match the same packet. Otherwise refuse the
+            # ambiguous pairs: overlapping local ports, overlapping remote ports, or
+            # a peer-only target against another remote-side one. A packet from one
+            # target's local port to another's remote port is the first target's:
+            # local-port filters have prefs below every remote one.
+            clash += [f"{a}/{b}" for a in ports for b in other.ports if a.overlaps(b)]
+            clash += [f"remote {a}/{b}" for a in remote_ports for b in other.remote_ports
+                      if a.overlaps(b)]
+            peer_only = not ports and not remote_ports
+            other_peer_only = not other.ports and not other.remote_ports
+            if (peer_only and (other.remote_ports or other_peer_only)) or (
+                    other_peer_only and (remote_ports or peer_only)):
                 clash += [f"peer {peer or 'any'}/{other.peer or 'any'}"]
         if clash:
             raise ConflictError(
@@ -468,10 +485,13 @@ def build_host_apply(
             )
 
     commands: list[Command] = []
+    inherited_clsact = False
     for old in stale_here:
         # A VM that was shaped on this device name has gone, and libvirt gave the
-        # name to this VM: its leftover filters and IFBs are cleared first.
+        # name to this VM: its leftover filters and IFBs are cleared first, and
+        # if wanshape added the clsact, the new slot takes over that record.
         commands += build_host_clear(old, live, keep_clsact=True)
+        inherited_clsact = inherited_clsact or old.added_clsact
         live.slots.pop(old.slot, None)
     state = live.iface(iface)
     if state.ingress_qdisc and not state.clsact:
@@ -492,7 +512,7 @@ def build_host_apply(
         slot_no = _free_slot(live, iface)
         added_clsact = False
 
-    if not clsact_present:
+    if not clsact_present or inherited_clsact:
         added_clsact = True
     elif any(s.added_clsact for s in live.slots.values()
              if s.iface == iface and s is not existing):
@@ -505,10 +525,13 @@ def build_host_apply(
         remote_ports=remote_ports, peer=peer, until=until, device=device,
         mac=mac.lower() if mac else None,
     )
-    if len(slot.filters()) > PREFS_PER_SLOT:
-        raise WanshapeError(
-            f"too many port ranges: they need {len(slot.filters())} filters, at most "
-            f"{PREFS_PER_SLOT} per target")
+    for remote in (False, True):
+        count = max((sum(1 for f in slot.filters() if f[0] == hook and f[3] == remote)
+                     for hook in ("egress", "ingress")), default=0)
+        if count > PREFS_PER_SLOT:
+            raise WanshapeError(
+                f"too many port ranges: they need {count} filters, at most "
+                f"{PREFS_PER_SLOT} per target")
     alias = slot.alias()
     if len(alias.encode()) > 255:
         raise WanshapeError("too many port ranges to record; merge some of them")
@@ -523,22 +546,14 @@ def build_host_apply(
     fresh.append(["ip", "link", "set", "dev", slot.up, "alias", alias])
     if not clsact_present:
         fresh.append(["tc", "qdisc", "add", "dev", iface, "clsact"])
-    prefs = {"egress": iter(slot_prefs(slot.slot)), "ingress": iter(slot_prefs(slot.slot))}
-    used: dict[str, list[int]] = {"egress": [], "ingress": []}
-    for hook, match, ifb in slot.filters():
-        pref = next(prefs[hook])
-        used[hook].append(pref)
+    prefs = {(hook, remote): iter(slot_prefs(slot.slot, remote))
+             for hook in ("egress", "ingress") for remote in (False, True)}
+    for hook, match, ifb, remote in slot.filters():
+        pref = next(prefs[(hook, remote)])
         fresh.append(["tc", "filter", "add", "dev", iface, hook, "pref", str(pref),
                       *match, "action", "mirred", "egress", "redirect", "dev", ifb])
 
-    rollback: list[Command] = []
-    for hook in ("egress", "ingress"):
-        for pref in used[hook]:
-            rollback.append(["tc", "filter", "del", "dev", iface, hook, "pref", str(pref)])
-    rollback += [["ip", "link", "del", slot.up], ["ip", "link", "del", slot.down]]
-    if not clsact_present:
-        rollback.append(["tc", "qdisc", "del", "dev", iface, "clsact"])
-    return HostPlan(slot=slot, commands=commands + fresh, rollback=rollback)
+    return HostPlan(slot=slot, commands=commands + fresh)
 
 
 def _free_slot(live: HostLive, iface: str) -> int:
@@ -547,7 +562,7 @@ def _free_slot(live: HostLive, iface: str) -> int:
     for slot in range(MAX_SLOTS):
         if slot in live.slots or {f"wsh{slot}up", f"wsh{slot}dn"} & live.ifbs:
             continue
-        if used_prefs & set(slot_prefs(slot)):
+        if used_prefs & all_slot_prefs(slot):
             continue
         return slot
     raise ConflictError(
@@ -558,7 +573,7 @@ def _free_slot(live: HostLive, iface: str) -> int:
 def build_host_clear(slot: HostSlot, live: HostLive, keep_clsact: bool = False) -> list[Command]:
     state = live.iface(slot.iface)
     commands: list[Command] = []
-    ours = set(slot_prefs(slot.slot))
+    ours = all_slot_prefs(slot.slot)
     if not state.exists:
         # The device is gone (and its filters with it): only our IFBs remain.
         return [["ip", "link", "del", dev] for dev in (slot.up, slot.down) if dev in live.ifbs]
@@ -593,13 +608,12 @@ def _undo(command: Command) -> Command | None:
     return None   # qdiscs on our own IFBs go with the IFB
 
 
-def run_plan(backend, commands: Sequence[Command], rollback: Sequence[Command] = ()) -> None:
+def run_plan(backend, commands: Sequence[Command]) -> None:
     """Run commands in order; on failure undo what *this run* created, and re-raise.
 
     Only the commands that succeeded are undone, in reverse order: if `ip link
     add wsh0up` fails because the device exists (another run took the slot),
-    that device isn't ours and is left alone. `rollback` is kept for callers'
-    compatibility and is no longer used.
+    that device isn't ours and is left alone.
     """
     done: list[Command] = []
     for command in commands:
