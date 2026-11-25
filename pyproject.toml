@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wanshape"
+version = "0.1.0"
+description = "Apply netem/tc WAN impairments to individual Podman/Docker containers"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+wanshape = "wanshape.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

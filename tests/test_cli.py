@@ -1,0 +1,151 @@
+import argparse
+import io
+import unittest
+from unittest import mock
+
+from wanshape import cli
+from wanshape.profiles import load_profiles
+from wanshape.inspector import LiveState
+from wanshape.target import Target
+from tests.fakes import FakeBackend
+
+
+def target() -> Target:
+    return Target(
+        name="test", id="abc", runtime="podman", rootless=True, pid=1,
+        netns_inode=42, userns_inode=43, network_mode="bridge", iface="eth0",
+        owner_uid=1000,
+    )
+
+
+def args(**overrides) -> argparse.Namespace:
+    values = dict(
+        container="test", profile=None, delay="10ms", jitter=None, loss=None,
+        loss_model=None, rate=None, runtime=None, iface=None, direction="both",
+        no_reorder=False, backend="nsenter", dry_run=False, force=False,
+        duration=None,
+    )
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
+class CliApplyTests(unittest.TestCase):
+    def setUp(self):
+        self.backend = FakeBackend()
+        self.state = {}
+        self.patches = [
+            mock.patch.object(cli, "resolve", return_value=target()),
+            mock.patch.object(cli, "get_backend", return_value=self.backend),
+            mock.patch.object(
+                cli, "inspect_live",
+                return_value=LiveState(root_kind="noqueue", root_handle="0:",
+                                       clsact=False, our_filter=False, ifb=False),
+            ),
+            mock.patch.object(cli, "load_state", side_effect=lambda: self.state),
+            mock.patch.object(cli, "save_state", side_effect=lambda s: self.state.update(s)),
+            mock.patch.object(cli, "make_entry", return_value={"profile": "inline"}),
+            mock.patch.object(Target, "verify", return_value=None),
+        ]
+        for patch in self.patches:
+            patch.start()
+        self.addCleanup(self.stop_patches)
+
+    def stop_patches(self):
+        for patch in reversed(self.patches):
+            patch.stop()
+
+    def test_ingress_only_is_applied(self):
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(cli._Commands.apply(args(direction="ingress")), 0)
+        self.assertTrue(any("mirred" in command for command in self.backend.commands))
+        self.assertFalse(any(command[:6] == ["tc", "qdisc", "replace", "dev", "eth0", "root"]
+                             for command in self.backend.commands))
+
+    def test_egress_only_is_applied(self):
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(cli._Commands.apply(args(direction="egress")), 0)
+        self.assertTrue(any("netem" in command for command in self.backend.commands))
+        self.assertFalse(any("mirred" in command for command in self.backend.commands))
+
+    def test_lossy_sip_reaches_tc_as_separate_args(self):
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(cli._Commands.apply(
+                args(delay=None, profile="lossy-sip", direction="egress")), 0)
+        netem = next(c for c in self.backend.commands if "netem" in c)
+        self.assertIn("gemodel", netem)
+        self.assertNotIn("gemodel 1% 25% 100% 0%", netem)
+
+    def test_dry_run_makes_no_changes(self):
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(cli._Commands.apply(args(dry_run=True)), 0)
+        self.assertEqual(self.backend.commands, [])
+        self.assertEqual(self.state, {})
+
+
+class CliLossModelTests(unittest.TestCase):
+    def test_cli_loss_model_syntax(self):
+        profile = cli._profile_from_args(args(loss_model="gemodel:1%,25%,100%,0%"))
+        self.assertEqual(profile.up.loss_model, "gemodel 1% 25% 100% 0%")
+        netem = profile.up.netem_args()
+        self.assertEqual(netem[netem.index("loss"):netem.index("loss") + 6],
+                         ["loss", "gemodel", "1%", "25%", "100%", "0%"])
+
+    def test_cli_loss_model_rejects_garbage(self):
+        with self.assertRaises(cli.ProfileError):
+            cli._profile_from_args(args(loss_model="gemodel:lots"))
+
+
+class CliReapplyTests(unittest.TestCase):
+    """A second apply over our own shaping must keep what the first one recorded."""
+
+    def setUp(self):
+        self.backend = FakeBackend()
+        self.state = {
+            "abc": {"id": "abc", "netns_inode": 42, "profile": "3g",
+                    "prior_root_qdisc": "fq_codel 0:", "added_clsact": True},
+        }
+        shaped = LiveState(root_kind="netem", root_handle="5753:", clsact=True,
+                           our_filter=True, ifb=True)
+        patches = [
+            mock.patch.object(cli, "resolve", return_value=target()),
+            mock.patch.object(cli, "get_backend", return_value=self.backend),
+            mock.patch.object(cli, "inspect_live", return_value=shaped),
+            mock.patch.object(cli, "load_state", side_effect=lambda: dict(self.state)),
+            mock.patch.object(cli, "save_state", side_effect=self._save),
+            mock.patch.object(Target, "verify", return_value=None),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def _save(self, entries):
+        self.state = entries
+
+    def test_reapply_keeps_prior_qdisc_and_clsact_ownership(self):
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(cli._Commands.apply(args(profile="4g", delay=None)), 0)
+        entry = self.state["abc"]
+        self.assertEqual(entry["profile"], "4g")
+        self.assertEqual(entry["prior_root_qdisc"], "fq_codel 0:")
+        self.assertTrue(entry["added_clsact"])
+        self.assertNotIn(["ip", "link", "add", "wanshape0", "type", "ifb"],
+                         self.backend.commands)
+
+    def test_reapply_then_clear_removes_clsact(self):
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            cli._Commands.apply(args(profile="4g", delay=None))
+            cli._Commands.clear(argparse.Namespace(
+                container="test", runtime=None, iface=None, direction="both", dry_run=False))
+        self.assertIn(["tc", "qdisc", "del", "dev", "eth0", "clsact"], self.backend.commands)
+        self.assertIn(["tc", "qdisc", "replace", "dev", "eth0", "root", "fq_codel"],
+                      self.backend.commands)
+
+    def test_recreated_container_does_not_inherit_old_state(self):
+        self.state["abc"]["netns_inode"] = 7
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            cli._Commands.apply(args(profile="4g", delay=None))
+        self.assertEqual(self.state["abc"]["prior_root_qdisc"], "netem 5753:")
+
+
+if __name__ == "__main__":
+    unittest.main()
