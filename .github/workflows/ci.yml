@@ -69,6 +69,17 @@ jobs:
       - run: podman pull -q docker.io/library/python:3.12-slim
       - run: sh tests/integration/netns_mode.sh
 
+  docker:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Kernel modules
+        run: |
+          sudo apt-get install -yq "linux-modules-extra-$(uname -r)" || echo "no modules-extra for $(uname -r)"
+          for m in sch_netem ifb act_mirred cls_flower cls_matchall; do sudo modprobe "$m" || echo "modprobe $m failed"; done
+      - run: docker pull -q docker.io/library/python:3.12-slim
+      - run: sudo sh tests/integration/docker_mode.sh
+
   vm:
     runs-on: ubuntu-24.04
     steps:
