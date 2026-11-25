@@ -56,11 +56,14 @@ def resolve(name: str, runtime: str | None = None, iface: str | None = None) -> 
 
 
 def _inspect(runtime: str, name: str) -> list[dict] | None:
-    result = subprocess.run(
-        [runtime, "inspect", "--type", "container", name],
-        text=True,
-        capture_output=True,
-    )
+    try:
+        result = subprocess.run(
+            [runtime, "inspect", "--type", "container", name],
+            text=True,
+            capture_output=True,
+        )
+    except FileNotFoundError:
+        return None  # this runtime isn't installed
     if result.returncode != 0:
         return None
     try:

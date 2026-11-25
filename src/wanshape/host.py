@@ -521,10 +521,13 @@ def inspect_container(name: str, runtime: str | None = None) -> tuple[str, dict]
     candidates = [runtime] if runtime else ["podman", "docker"]
     for runtime_name in candidates:
         for prefix in _inspect_prefixes(runtime_name):
-            result = subprocess.run(
-                [*prefix, runtime_name, "inspect", "--type", "container", name],
-                text=True, capture_output=True,
-            )
+            try:
+                result = subprocess.run(
+                    [*prefix, runtime_name, "inspect", "--type", "container", name],
+                    text=True, capture_output=True,
+                )
+            except FileNotFoundError:
+                break  # this runtime isn't installed
             if result.returncode != 0:
                 continue
             try:

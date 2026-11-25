@@ -147,5 +147,24 @@ class CliReapplyTests(unittest.TestCase):
         self.assertEqual(self.state["abc"]["prior_root_qdisc"], "netem 5753:")
 
 
+class MissingRuntimeTests(unittest.TestCase):
+    def test_unknown_name_without_docker_installed(self):
+        """Podman doesn't know the name and docker isn't installed: an error, not a traceback."""
+        from wanshape import host, target
+        from wanshape.errors import WanshapeError
+
+        def fake_run(cmd, **kwargs):
+            if cmd[0] == "docker" or "docker" in cmd:
+                raise FileNotFoundError(2, "No such file or directory", "docker")
+            import subprocess
+            return subprocess.CompletedProcess(cmd, 125, "", "no such container")
+
+        with mock.patch("subprocess.run", side_effect=fake_run):
+            with self.assertRaises(WanshapeError):
+                target.resolve("nothing-here")
+            with self.assertRaises(WanshapeError):
+                host.inspect_container("nothing-here")
+
+
 if __name__ == "__main__":
     unittest.main()
