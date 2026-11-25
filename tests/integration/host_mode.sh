@@ -137,7 +137,7 @@ echo "ok   remote ports and peer"
 
 # More netem options (#10): every packet duplicated means two echoes per probe.
 ws apply-host dup --ports 43000 --iface h0 --delay 1ms --duplicate 100% --direction egress \
-    --raw-netem "seed 1" > /dev/null
+    --raw-netem ecn > /dev/null
 got=$(python3 -c '
 import socket
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("10.9.0.1", 43000)); s.settimeout(0.5)

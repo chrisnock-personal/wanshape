@@ -57,7 +57,7 @@ More netem options, as CLI flags (inline settings) or profile fields:
 | `--duplicate 1%` | `duplicate` | send some packets twice |
 | `--corrupt 0.1%` | `corrupt` | flip one bit in some packets |
 | `--slot 10ms,30ms` | `slot = "10ms 30ms"` | hold packets and release them in bursts, as Wi-Fi and LTE schedulers do |
-| `--seed 42` | `seed` | fixed random seed, for runs you can repeat |
+| `--seed 42` | `seed` | fixed random seed, for runs you can repeat (needs a recent iproute2: Fedora 44's 6.17 has it, Ubuntu 24.04's 6.1 doesn't) |
 | `--raw-netem "ecn"` | `raw` | any other netem arguments, appended as given |
 | `--rate-mode accurate` | `rate_mode = "accurate"` (profile level) | HTB enforces the rate and netem adds the rest, instead of netem's own rate |
 
