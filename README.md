@@ -201,3 +201,7 @@ WANSHAPE_VM_IMAGE=cirros-0.6.2-x86_64-disk.img sh tests/integration/vm_mode.sh  
 ```
 
 The integration tests measure real round-trip times with and without shaping, and check that everything is removed afterwards.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
