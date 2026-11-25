@@ -117,6 +117,8 @@ sudo ./bin/wanshape apply-host callraven --profile 3g --iface eth0
 
 # Explicit ports; then the name is only a label and no container is needed.
 sudo ./bin/wanshape apply-host softphone --ports 5060,10000-20000 --delay 80ms --loss 2%
+sudo ./bin/wanshape apply-host callraven --remote-ports 8088 --peer 192.168.1.167 --profile 3g   # plus its WebSocket SIP
+sudo ./bin/wanshape apply-host pbx-leg --peer 192.168.1.167 --profile voip-bad                     # everything with one host
 
 wanshape status                            # no root needed
 sudo ./bin/wanshape clear-host callraven
@@ -127,7 +129,8 @@ The dry run prints the ports and where they came from. Check them: a port the co
 
 Things to know:
 
-- **Local ports only.** A connection from a random local port isn't matched, even if the far end's port is well known. For example, SIP over WebSocket from a browser-style client uses a random local port, so only its RTP is shaped.
+- **Local ports by default.** A connection from a random local port isn't matched by `--ports`. For those, add `--remote-ports`: SIP over WebSocket to a PBX's port 8088, for example, with `--remote-ports 8088` (or a `wanshape.remote_ports` label on the container).
+- **`--peer ADDRESS` limits everything to one remote host**, such as the PBX. On its own (no ports) it shapes all traffic with that host, which is the simplest way to put one leg of a call on a bad network.
 - **Loopback isn't shaped.** Traffic between processes on the same host never reaches the interface.
 - **One interface per target.** Pick the one that carries the traffic you care about, for example with `--via <peer address>`.
 - Up to 10 host targets at once. Their ports must not overlap on the same interface.

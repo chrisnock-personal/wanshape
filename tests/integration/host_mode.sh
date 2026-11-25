@@ -25,12 +25,15 @@ ip link add h0 type veth peer name p0
 ip link set p0 netns peer
 ip addr add 10.9.0.1/24 dev h0
 ip link set h0 up
-ip netns exec peer sh -c 'ip link set lo up; ip addr add 10.9.0.2/24 dev p0; ip link set p0 up'
+ip netns exec peer sh -c 'ip link set lo up; ip addr add 10.9.0.2/24 dev p0; ip addr add 10.9.0.3/24 dev p0; ip link set p0 up'
 
 # UDP echo and a TCP listener on the peer.
 ip netns exec peer python3 -c '
-import socket, threading
-u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.bind(("10.9.0.2", 9999))
+import socket, threading, select
+# One socket per address, so a reply comes from the address that was asked.
+us = []
+for addr in ("10.9.0.2", "10.9.0.3"):
+    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.bind((addr, 9999)); us.append(u)
 t = socket.socket(); t.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 t.bind(("10.9.0.2", 9998)); t.listen(64)
 def tcp():
@@ -38,7 +41,8 @@ def tcp():
         c, _ = t.accept(); c.close()
 threading.Thread(target=tcp, daemon=True).start()
 while True:
-    d, a = u.recvfrom(2000); u.sendto(d, a)
+    for u in select.select(us, [], [])[0]:
+        d, a = u.recvfrom(2000); u.sendto(d, a)
 ' &
 PEER=$!
 trap 'kill $PEER 2>/dev/null || true' EXIT
@@ -48,7 +52,9 @@ sleep 0.3
 rtt() {
     python3 - "$1" "$2" <<'EOF'
 import socket, struct, sys, time
+import os
 proto, port = sys.argv[1], int(sys.argv[2])
+dest = os.environ.get("DEST", "10.9.0.2")
 samples = []
 tries = 0
 while len(samples) < 7:
@@ -59,7 +65,7 @@ while len(samples) < 7:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind(("10.9.0.1", port)); s.settimeout(1)
-        t = time.monotonic(); s.sendto(b"x", ("10.9.0.2", 9999))
+        t = time.monotonic(); s.sendto(b"x", (dest, 9999))
         try:
             s.recv(10)
         except TimeoutError:  # profiles with loss may drop a probe
@@ -115,6 +121,20 @@ expect "all cleared" udp 42000 0 5
 tc qdisc show dev h0 | grep -q clsact && fail "clsact left behind"
 ip link show type ifb | grep -q wsh && fail "IFB left behind"
 echo "ok   nothing left behind"
+# Clients on random local ports (#11): match the remote port, optionally one peer.
+ws apply-host ws-client --remote-ports 9999 --iface h0 --delay 40ms > /dev/null
+expect "remote port 9999 from a random local port" udp 0 75 100
+DEST=10.9.0.3 expect "...to another host too" udp 0 75 100
+ws apply-host ws-client --remote-ports 9999 --peer 10.9.0.2 --iface h0 --delay 40ms > /dev/null
+expect "peer 10.9.0.2 shaped" udp 0 75 100
+DEST=10.9.0.3 expect "other host not shaped" udp 0 0 5
+ws apply-host ws-client --peer 10.9.0.3 --iface h0 --delay 25ms > /dev/null
+DEST=10.9.0.3 expect "peer only: all traffic with 10.9.0.3" udp 0 45 65
+expect "peer only: 10.9.0.2 not shaped" udp 0 0 5
+ws status | grep -q "ws-client: host mode, iface=h0 peer=10.9.0.3" || fail "status for a peer target"
+ws clear-host ws-client > /dev/null
+echo "ok   remote ports and peer"
+
 # More netem options (#10): every packet duplicated means two echoes per probe.
 ws apply-host dup --ports 43000 --iface h0 --delay 1ms --duplicate 100% --direction egress \
     --raw-netem "seed 1" > /dev/null

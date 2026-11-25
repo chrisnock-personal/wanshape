@@ -29,6 +29,7 @@ be read without root.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
@@ -187,6 +188,8 @@ class HostSlot:
     direction: str
     added_clsact: bool
     kind: str = "ports"  # "ports" or "vm"
+    remote_ports: list[PortRange] = field(default_factory=list)
+    peer: str | None = None  # only traffic with this address
 
     @property
     def up(self) -> str:
@@ -197,12 +200,28 @@ class HostSlot:
         return f"wsh{self.slot}dn"
 
     def alias(self) -> str:
-        ports = format_ports(self.ports) if self.ports else "all"
+        ports = format_ports(self.ports) if self.ports else (
+            "all" if self.kind == "vm" else "-")
+        extra = ""
+        if self.remote_ports:
+            extra += f" rports={format_ports(self.remote_ports)}"
+        if self.peer:
+            extra += f" peer={self.peer}"
         return (
             f"{ALIAS_PREFIX} name={self.name} kind={self.kind} profile={self.profile} "
             f"iface={self.iface} ports={ports} dir={self.direction} "
-            f"clsact={int(self.added_clsact)}"
+            f"clsact={int(self.added_clsact)}{extra}"
         )
+
+    def describe(self) -> str:
+        parts = []
+        if self.ports:
+            parts.append(f"ports={format_ports(self.ports)}")
+        if self.remote_ports:
+            parts.append(f"remote-ports={format_ports(self.remote_ports)}")
+        if self.peer:
+            parts.append(f"peer={self.peer}")
+        return " ".join(parts)
 
     def filters(self) -> list[tuple[str, list[str], str]]:
         """(hook, match arguments, IFB) for each filter this target needs."""
@@ -214,14 +233,26 @@ class HostSlot:
                 if self.direction in (want, "both"):
                     result.append((hook, ["protocol", "all", "matchall"], ifb))
             return result
-        for hook, key, ifb in (("egress", "src_port", self.up),
-                               ("ingress", "dst_port", self.down)):
+        families = ("ip", "ipv6")
+        if self.peer:
+            families = ("ipv6",) if ":" in self.peer else ("ip",)
+        # Outgoing: our port is the source, the remote's the destination; incoming
+        # the other way round.
+        for hook, local_key, remote_key, ip_key, ifb in (
+                ("egress", "src_port", "dst_port", "dst_ip", self.up),
+                ("ingress", "dst_port", "src_port", "src_ip", self.down)):
             if self.direction not in (hook, "both"):
                 continue
-            for r in self.ports:
-                for proto, ip_proto in _PROTOCOLS:
-                    result.append((hook, ["protocol", proto, "flower", "ip_proto", ip_proto,
-                                          key, str(r)], ifb))
+            peer = [ip_key, self.peer] if self.peer else []
+            matches = ([(local_key, r) for r in self.ports]
+                       + [(remote_key, r) for r in self.remote_ports])
+            for proto in families:
+                if not matches:  # peer only: everything with that host
+                    result.append((hook, ["protocol", proto, "flower", *peer], ifb))
+                for key, r in matches:
+                    for ip_proto in ("udp", "tcp"):
+                        result.append((hook, ["protocol", proto, "flower", "ip_proto",
+                                              ip_proto, *peer, key, str(r)], ifb))
         return result
 
 
@@ -238,15 +269,18 @@ def parse_alias(slot: int, alias: str) -> HostSlot | None:
     )
     try:
         kind = fields.get("kind", "ports")
+        ports = fields["ports"]
         return HostSlot(
             slot=slot,
             name=fields["name"],
             profile=fields.get("profile", "unknown"),
             iface=fields["iface"],
-            ports=[] if kind == "vm" else parse_ports(fields["ports"]),
+            ports=[] if kind == "vm" or ports == "-" else parse_ports(ports),
             direction=fields.get("dir", "both"),
             added_clsact=fields.get("clsact") == "1",
             kind=kind,
+            remote_ports=parse_ports(fields["rports"]) if "rports" in fields else [],
+            peer=fields.get("peer"),
         )
     except (KeyError, WanshapeError):
         return None
@@ -357,18 +391,26 @@ def build_host_apply(
     direction: str,
     live: HostLive,
     kind: str = "ports",
+    remote_ports: list[PortRange] | None = None,
+    peer: str | None = None,
 ) -> HostPlan:
     """Plan a ports target, or with kind="vm" (and no ports) a whole tap device."""
+    remote_ports = list(remote_ports or [])
+    if peer is not None:
+        try:
+            peer = str(ipaddress.ip_address(peer))
+        except ValueError as exc:
+            raise WanshapeError(f"invalid peer address {peer!r}") from exc
     if direction not in ("egress", "ingress", "both"):
         raise WanshapeError(f"invalid direction {direction!r}")
     if not _NAME.match(name):
         raise WanshapeError(f"invalid target name {name!r}")
     if kind == "vm" and ports:
         raise WanshapeError("a VM target shapes the whole device; it takes no ports")
-    if kind == "ports" and not ports:
-        raise WanshapeError("no ports given")
-    if len(ports) > MAX_RANGES:
-        raise WanshapeError(f"too many port ranges ({len(ports)}; at most {MAX_RANGES})")
+    if kind == "vm" and (remote_ports or peer):
+        raise WanshapeError("a VM target shapes the whole device; no remote ports or peer")
+    if kind == "ports" and not (ports or remote_ports or peer):
+        raise WanshapeError("no ports given (local ports, --remote-ports or --peer)")
 
     existing = live.by_name(name)
     if existing and existing.kind != kind:
@@ -384,6 +426,11 @@ def build_host_apply(
                 f"clear it first with `wanshape clear-host {other.name}`"
             )
         clash = [f"{a}/{b}" for a in ports for b in other.ports if a.overlaps(b)]
+        if not peer or not other.peer or peer == other.peer:
+            clash += [f"remote {a}/{b}" for a in remote_ports for b in other.remote_ports
+                      if a.overlaps(b)]
+            if (not ports and not remote_ports) or (not other.ports and not other.remote_ports):
+                clash += [f"peer {peer or 'any'}/{other.peer or 'any'}"]
         if clash:
             raise ConflictError(
                 f"ports overlap host target {other.name!r} on {iface} ({', '.join(clash)}); "
@@ -420,7 +467,12 @@ def build_host_apply(
     slot = HostSlot(
         slot=slot_no, name=name, profile=profile.name, iface=iface,
         ports=list(ports), direction=direction, added_clsact=added_clsact, kind=kind,
+        remote_ports=remote_ports, peer=peer,
     )
+    if len(slot.filters()) > PREFS_PER_SLOT:
+        raise WanshapeError(
+            f"too many port ranges: they need {len(slot.filters())} filters, at most "
+            f"{PREFS_PER_SLOT} per target")
     alias = slot.alias()
     if len(alias.encode()) > 255:
         raise WanshapeError("too many port ranges to record; merge some of them")
@@ -553,12 +605,21 @@ def _inspect_prefixes(runtime: str) -> list[list[str]]:
 
 
 def host_ports_for(name: str, runtime: str | None, ports_spec: str | None,
-                   inspect: Callable[[str, str | None], tuple[str, dict]] = inspect_container
-                   ) -> tuple[list[PortRange], str]:
-    """Ports to shape for `name`: --ports if given, else from the host-network container."""
+                   inspect: Callable[[str, str | None], tuple[str, dict]] = inspect_container,
+                   optional: bool = False) -> tuple[list[PortRange], str]:
+    """Ports to shape for `name`: --ports if given, else from the host-network container.
+
+    With optional=True (remote ports or a peer were given), a name that isn't a
+    container is just a label and gets no local ports.
+    """
     if ports_spec:
         return parse_ports(ports_spec), "--ports"
-    _, obj = inspect(name, runtime)
+    try:
+        _, obj = inspect(name, runtime)
+    except WanshapeError:
+        if optional:
+            return [], "none"
+        raise
     if not (obj.get("State") or {}).get("Running"):
         raise WanshapeError(f"container {name!r} is not running")
     mode = (obj.get("HostConfig") or {}).get("NetworkMode")
@@ -567,4 +628,21 @@ def host_ports_for(name: str, runtime: str | None, ports_spec: str | None,
             f"container {name!r} is not on host networking ({mode}); "
             f"use `wanshape apply {name}` to shape it inside its own namespace"
         )
-    return ports_from_container(obj)
+    try:
+        return ports_from_container(obj)
+    except WanshapeError:
+        if optional:
+            return [], "none"
+        raise
+
+
+def remote_ports_from_container(name: str, runtime: str | None,
+                                inspect: Callable[[str, str | None], tuple[str, dict]]
+                                = inspect_container) -> list[PortRange]:
+    """The `wanshape.remote_ports` label of a container, if it has one."""
+    try:
+        _, obj = inspect(name, runtime)
+    except WanshapeError:
+        return []
+    label = ((obj.get("Config") or {}).get("Labels") or {}).get("wanshape.remote_ports")
+    return parse_ports(label) if label else []

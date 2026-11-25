@@ -17,6 +17,8 @@ from .host import (
     build_host_clear,
     format_ports,
     host_ports_for,
+    parse_ports,
+    remote_ports_from_container,
     inspect_host,
     require_root,
     resolve_host_iface,
@@ -71,6 +73,11 @@ def _parser() -> argparse.ArgumentParser:
     host.add_argument("name", help="host-network container, or a label when --ports is given")
     _add_profile_args(host)
     host.add_argument("--ports", help="local ports to shape, e.g. 5060,10000-20000 (UDP and TCP)")
+    host.add_argument("--remote-ports", metavar="PORTS",
+                      help="also shape traffic to/from these remote ports, e.g. 8088 for "
+                      "clients on random local ports (SIP over WebSocket)")
+    host.add_argument("--peer", metavar="ADDRESS",
+                      help="only traffic with this address; alone, all traffic with it")
     host.add_argument("--runtime", choices=("podman", "docker"))
     where = host.add_mutually_exclusive_group()
     where.add_argument("--iface", help="host interface (default: the default route's)")
@@ -298,7 +305,7 @@ class _Commands:
         for slot in host_slots:
             gone = not host_live.iface(slot.iface).exists
             what = (f"vm mode, device={slot.iface}" if slot.kind == "vm"
-                    else f"host mode, iface={slot.iface} ports={format_ports(slot.ports)}")
+                    else f"host mode, iface={slot.iface} {slot.describe()}")
             print(f"{slot.name}: {what} profile={slot.profile} direction={slot.direction}"
                   + (f" STALE ({slot.iface} is gone; re-apply or clear-host)" if gone else ""))
             for dev in (slot.up, slot.down):
@@ -354,12 +361,16 @@ class _Commands:
 
 def _apply_host(args: argparse.Namespace) -> int:
     profile = _profile_from_args(args)
-    ports, source = host_ports_for(args.name, args.runtime, args.ports)
+    remote = (parse_ports(args.remote_ports) if args.remote_ports
+              else remote_ports_from_container(args.name, args.runtime))
+    ports, source = host_ports_for(args.name, args.runtime, args.ports,
+                                   optional=bool(remote or args.peer))
     backend = HostBackend()
-    iface = resolve_host_iface(backend, args.iface, args.via)
+    iface = resolve_host_iface(backend, args.iface, args.via or args.peer)
     live = inspect_host(backend, [iface])
-    plan = build_host_apply(args.name, profile, ports, iface, args.direction, live)
-    print(f"# host target: {args.name}, ports {format_ports(ports)} (from {source})")
+    plan = build_host_apply(args.name, profile, ports, iface, args.direction, live,
+                            remote_ports=remote, peer=args.peer)
+    print(f"# host target: {args.name}, {plan.slot.describe()} (local ports from {source})")
     print(f"# iface {iface}, slot {plan.slot.slot}, {args.direction}")
     for command in plan.commands:
         print("+ " + shlex.join(command))
@@ -372,7 +383,7 @@ def _apply_host(args: argparse.Namespace) -> int:
         print(f"wanshape: apply-host failed and was rolled back: {exc}", file=sys.stderr)
         return EXIT_ERROR
     print(f"{args.name}: applied {profile.name} to {args.direction} on {iface} "
-          f"ports {format_ports(ports)}")
+          f"{plan.slot.describe()}")
     return 0
 
 

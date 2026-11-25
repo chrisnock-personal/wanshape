@@ -165,6 +165,69 @@ class ApplyTests(unittest.TestCase):
         self.assertEqual(plan.slot.slot, 1)
 
 
+class RemotePeerTests(unittest.TestCase):
+    """#11: remote ports and a peer address."""
+
+    def plan(self, ports="", remote=None, peer=None, live=None):
+        return build_host_apply("cr", profile(), parse_ports(ports) if ports else [], "eth0",
+                                "both", live or HostLive(),
+                                remote_ports=parse_ports(remote) if remote else None, peer=peer)
+
+    def test_remote_ports_swap_the_keys(self):
+        f = filters(self.plan(remote="8088").commands)
+        egress = [c for c in f if c[5] == "egress"]
+        ingress = [c for c in f if c[5] == "ingress"]
+        self.assertTrue(all("dst_port" in c for c in egress))
+        self.assertTrue(all("src_port" in c for c in ingress))
+        self.assertEqual(len(f), 8)
+
+    def test_peer_limits_family_and_address(self):
+        f = filters(self.plan(ports="5060", peer="192.168.1.167").commands)
+        self.assertEqual(len(f), 4)   # IPv4 only: udp+tcp, both hooks
+        self.assertTrue(all("ip" == c[c.index("protocol") + 1] for c in f))
+        egress = next(c for c in f if c[5] == "egress")
+        self.assertEqual(egress[egress.index("dst_ip") + 1], "192.168.1.167")
+        ingress = next(c for c in f if c[5] == "ingress")
+        self.assertEqual(ingress[ingress.index("src_ip") + 1], "192.168.1.167")
+
+    def test_peer_only_matches_all_traffic_with_it(self):
+        f = filters(self.plan(peer="2001:db8::1").commands)
+        self.assertEqual(len(f), 2)
+        self.assertNotIn("ip_proto", f[0])
+        self.assertIn("ipv6", f[0])
+
+    def test_alias_round_trip(self):
+        plan = self.plan(remote="8088,5060", peer="10.0.0.1")
+        alias = next(c[-1] for c in plan.commands if "alias" in c)
+        back = host.parse_alias(0, alias)
+        self.assertEqual((back.ports, format_ports(back.remote_ports), back.peer),
+                         ([], "5060,8088", "10.0.0.1"))
+
+    def test_nothing_to_match(self):
+        with self.assertRaises(WanshapeError):
+            self.plan()
+        with self.assertRaises(WanshapeError):
+            self.plan(ports="5060", peer="not-an-address")
+
+    def test_overlapping_remote_ports_refused(self):
+        other = HostSlot(0, "a", "3g", "eth0", [], "both", True, remote_ports=parse_ports("8088"))
+        live = HostLive(slots={0: other}, ifbs={"wsh0up", "wsh0dn"},
+                        ifaces={"eth0": IfaceState(clsact=True)})
+        with self.assertRaises(ConflictError):
+            self.plan(remote="8000-9000", live=live)
+        # A different peer makes them distinct.
+        other.peer = "10.0.0.1"
+        self.plan(remote="8000-9000", peer="10.0.0.2", live=live)
+
+    def test_label_name_without_container(self):
+        def missing(name, runtime):
+            raise WanshapeError("not found")
+        self.assertEqual(host_ports_for("ws", None, None, inspect=missing, optional=True),
+                         ([], "none"))
+        with self.assertRaises(WanshapeError):
+            host_ports_for("ws", None, None, inspect=missing)
+
+
 class ClearTests(unittest.TestCase):
     def test_clear_last_target_removes_clsact(self):
         live = HostLive(slots={0: slot()}, ifbs={"wsh0up", "wsh0dn"},
