@@ -1,14 +1,16 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "wanshape"
-version = "0.3.0"
+version = "0.4.0"
 description = "Apply netem/tc WAN impairments to one container, one service's ports, or one libvirt VM"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = []
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Chris" }]
 keywords = ["netem", "tc", "network emulation", "wan", "podman", "docker", "libvirt", "voip", "testing"]
 classifiers = [
