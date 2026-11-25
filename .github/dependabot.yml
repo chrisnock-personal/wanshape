@@ -1,0 +1,11 @@
+# Weekly update PRs for the GitHub Actions the workflows use (checkout,
+# setup-python, cache, upload/download-artifact, pypi-publish). wanshape has no
+# Python dependencies, so there's nothing else to update. CI tests each PR.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly, day: monday }
+    groups:
+      actions:
+        patterns: ["*"]
