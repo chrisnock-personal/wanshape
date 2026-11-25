@@ -30,7 +30,7 @@ from .planner import build_apply_plan, build_clear_plan
 from .profiles import Direction, Profile, ProfileError, load_profiles
 from .state import load_state, make_entry, save_state
 from .target import Target, netns_members, resolve
-from .vm import resolve_vm
+from .vm import device_kind, resolve_vm
 
 EXIT_ERROR = 1
 EXIT_UNSUPPORTED = 2
@@ -280,6 +280,7 @@ class _Commands:
             entries = load_state()
         targets: list[tuple[Target, dict | None]] = []
         names = _names(args.container)
+        missing = 0
         if names:
             host_names = {s.name for s in inspect_host(HostBackend()).slots.values()}
             for name in names:
@@ -287,9 +288,11 @@ class _Commands:
                     target = resolve(name)
                     targets.append((target, _entry_for(entries, target)))
                 except WanshapeError:
-                    # Host-network containers and --ports labels live in host mode only.
+                    # Host-network containers, labels and VMs live in host/VM mode only.
                     if name not in host_names:
-                        raise
+                        print(f"{name}: no wanshape shaping (not a running container, "
+                              "and no host or VM target by that name)")
+                        missing += 1
         else:
             for entry in entries.values():
                 target = None
@@ -348,9 +351,9 @@ class _Commands:
                   + (" STALE (container recreated)" if stale else ""))
             if live.egress or live.ingress:
                 print(stats(backend, target.iface))
-        if not shown:
+        if not shown and not missing:
             print("no wanshape shaping found" if args.all else "no wanshape state found")
-        return 0
+        return EXIT_ERROR if missing else 0
 
     @staticmethod
     def clear(args: argparse.Namespace) -> int:
@@ -532,7 +535,8 @@ def _apply_vm(args: argparse.Namespace) -> int:
     plans = []
     for name, iface in vms:
         plan = build_host_apply(name, profile, [], iface.device, args.direction, live,
-                                kind="vm", until=timer.until(seconds) if seconds else None)
+                                kind="vm", until=timer.until(seconds) if seconds else None,
+                                device=device_kind(iface.type))
         print(f"# VM: {name}, {iface.type} {iface.source}, MAC {iface.mac}")
         print(f"# host device {iface.device}, slot {plan.slot.slot}, {args.direction} "
               "(egress = from the VM)")
@@ -545,7 +549,7 @@ def _apply_vm(args: argparse.Namespace) -> int:
     code = _run_host_plans(backend, plans, args, profile, seconds)
     if code == 0 and args.persist:
         for name, iface in vms:
-            vmhook.remember(name, profile, args.direction, iface.mac)
+            vmhook.remember(name, profile, args.direction, iface.mac, device_kind(iface.type))
         print(f"recorded in {vmhook.CONFIG}: re-applied whenever libvirt starts "
               + ", ".join(n for n, _ in vms))
         if not vmhook.HOOK.exists():
@@ -562,9 +566,10 @@ def _vm_hook(args: argparse.Namespace) -> int:
         xml_text = sys.stdin.read() if not sys.stdin.isatty() else ""
         backend = HostBackend()
 
-        def apply_fn(name, profile, direction, device):
+        def apply_fn(name, profile, direction, device, device_type="tap"):
             live = inspect_host(backend, [device])
-            plan = build_host_apply(name, profile, [], device, direction, live, kind="vm")
+            plan = build_host_apply(name, profile, [], device, direction, live, kind="vm",
+                                    device=device_type)
             run_plan(backend, plan.commands, plan.rollback)
 
         def release_fn(name):

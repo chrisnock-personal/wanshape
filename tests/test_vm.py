@@ -23,8 +23,12 @@ class DomiflistTests(unittest.TestCase):
                 "-------------------------------------------------------\n" + TWO)
         self.assertEqual([i.device for i in parse_domiflist(text)], ["vnet3", "vnet4"])
 
-    def test_direct_refused(self):
-        with self.assertRaises(UnsupportedTarget):
+    def test_direct_is_macvtap(self):
+        from wanshape.vm import device_kind
+        running = parse_domiflist(" macvtap3   direct   wsdummy0   virtio   52:54:00:7d:17:9c\n")
+        chosen = choose_interface("m2", running)
+        self.assertEqual((chosen.device, device_kind(chosen.type)), ("macvtap3", "macvtap"))
+        with self.assertRaises(WanshapeError):   # not running: no device yet
             choose_interface("freepbx", parse_domiflist(DIRECT))
 
     def test_user_networking_refused(self):
@@ -71,6 +75,20 @@ class DomiflistTests(unittest.TestCase):
         finally:
             vm.check_tap_mac = original
         self.assertEqual(calls, [("qemu:///session", ("domiflist", "web"))])
+
+
+class MacvtapPlanTests(unittest.TestCase):
+    def test_macvtap_hooks_run_like_a_container_interface(self):
+        plan = build_host_apply("m2", load_profiles()["3g"], [], "macvtap3", "both", HostLive(),
+                                kind="vm", device="macvtap")
+        f = {c[5]: c[-1] for c in plan.commands if c[:3] == ["tc", "filter", "add"]}
+        self.assertEqual(f, {"egress": "wsh0up", "ingress": "wsh0dn"})
+        alias = next(c[-1] for c in plan.commands if "alias" in c)
+        self.assertEqual(parse_alias(0, alias).device, "macvtap")
+
+    def test_macvtap_mac_is_the_guest_mac(self):
+        same = lambda args: json.dumps([{"address": "52:54:00:7d:17:9c"}])  # noqa: E731
+        check_tap_mac("macvtap3", "52:54:00:7d:17:9c", run=same)
 
 
 class VmPlanTests(unittest.TestCase):

@@ -205,3 +205,34 @@ then UDP offered at 8 mbit/s for 6 s. Two runs each, the same both times:
 
 No measurable difference on this kernel; `accurate` stays opt-in. (UDP loss is below 50% because the
 queued packets still arrive after the 6 s send.)
+
+# VM-to-VM, macvtap and --duration as root — the PC, 2026-11-25
+
+Four throwaway CirrOS VMs under libvirt in WSL2, each booted with a NoCloud seed disk that set a static
+address and pinged its partner in a loop, writing the results to its serial log (no guest login needed):
+`a` and `b` on an isolated libvirt network (taps), `m1` and `m2` on `direct` interfaces in bridge mode on
+a dummy parent (macvtap). Everything was removed afterwards.
+
+**VM-to-VM across a bridge (#2).** `a` -> `b`: 0.63 ms; with `apply-vm ws-b --delay 40ms` (only `b`
+shaped) 80.9 ms; cleared 0.72 ms. Traffic between VMs on the same bridge goes through the shaped tap.
+
+**Macvtap hook directions (#1).** Raw tc on `m2`'s macvtap device, 100 ms delay for one flow at a time,
+measured as `m1` -> `m2` round trip (baseline 0.50 ms):
+
+| hook | packets from `m1` (into `m2`) | packets from `m2` (out of it) |
+|---|---|---|
+| egress | 0.48 ms (not seen) | 101.1 ms |
+| ingress | 100.7 ms | 0.48 ms (not seen) |
+
+So on macvtap the egress hook carries what the guest sends and the ingress hook what it receives: the
+reverse of a tap, the same as a container's own interface. The macvtap device carries the guest's MAC
+unchanged. With that mapping, `apply-vm ws-m2 --delay 40ms` gave 80.7 ms, 100% loss on `--direction
+egress`/`ingress` dropped on `wsh0up`/`wsh0dn` respectively, and clearing gave 0.52 ms.
+
+**`--duration` as root (#5).** `apply-vm ws-b --delay 30ms --duration 15s`: 60.6 ms while active, one
+system timer; after it fired the target was gone, `a` -> `b` 0.35 ms, no timer left. `apply-host
+--duration 10s` on the test bridge cleared itself the same way and removed the `clsact` it added.
+
+Not run: a real VM restart with the libvirt hook (#3) installed, because it means writing a hook to
+`/etc/libvirt/hooks` and restarting the libvirt daemon on the PC. The hook is tested by calling it the
+way libvirt does (`tests/integration/vm_mode.sh`).

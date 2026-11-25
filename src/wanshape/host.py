@@ -191,6 +191,7 @@ class HostSlot:
     remote_ports: list[PortRange] = field(default_factory=list)
     peer: str | None = None  # only traffic with this address
     until: int | None = None  # epoch seconds when a --duration timer clears it
+    device: str = "tap"  # VM mode: "tap" or "macvtap" (hooks the other way round)
 
     @property
     def up(self) -> str:
@@ -210,6 +211,8 @@ class HostSlot:
             extra += f" peer={self.peer}"
         if self.until:
             extra += f" until={self.until}"
+        if self.kind == "vm" and self.device != "tap":
+            extra += f" dev={self.device}"
         return (
             f"{ALIAS_PREFIX} name={self.name} kind={self.kind} profile={self.profile} "
             f"iface={self.iface} ports={ports} dir={self.direction} "
@@ -230,9 +233,12 @@ class HostSlot:
         """(hook, match arguments, IFB) for each filter this target needs."""
         result: list[tuple[str, list[str], str]] = []
         if self.kind == "vm":
-            # Tap device: ingress = from the guest (up), egress = to the guest (down).
-            for want, hook, ifb in (("egress", "ingress", self.up),
-                                    ("ingress", "egress", self.down)):
+            # Tap: ingress = from the guest (up), egress = to the guest (down).
+            # Macvtap: the other way round, like a container's own interface.
+            hooks = ((("egress", "ingress", self.up), ("ingress", "egress", self.down))
+                     if self.device == "tap" else
+                     (("egress", "egress", self.up), ("ingress", "ingress", self.down)))
+            for want, hook, ifb in hooks:
                 if self.direction in (want, "both"):
                     result.append((hook, ["protocol", "all", "matchall"], ifb))
             return result
@@ -285,6 +291,7 @@ def parse_alias(slot: int, alias: str) -> HostSlot | None:
             remote_ports=parse_ports(fields["rports"]) if "rports" in fields else [],
             peer=fields.get("peer"),
             until=int(fields["until"]) if fields.get("until", "").isdigit() else None,
+            device=fields.get("dev", "tap"),
         )
     except (KeyError, WanshapeError):
         return None
@@ -398,6 +405,7 @@ def build_host_apply(
     remote_ports: list[PortRange] | None = None,
     peer: str | None = None,
     until: int | None = None,
+    device: str = "tap",
 ) -> HostPlan:
     """Plan a ports target, or with kind="vm" (and no ports) a whole tap device."""
     remote_ports = list(remote_ports or [])
@@ -472,7 +480,7 @@ def build_host_apply(
     slot = HostSlot(
         slot=slot_no, name=name, profile=profile.name, iface=iface,
         ports=list(ports), direction=direction, added_clsact=added_clsact, kind=kind,
-        remote_ports=remote_ports, peer=peer, until=until,
+        remote_ports=remote_ports, peer=peer, until=until, device=device,
     )
     if len(slot.filters()) > PREFS_PER_SLOT:
         raise WanshapeError(

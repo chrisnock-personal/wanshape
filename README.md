@@ -8,9 +8,9 @@ Three modes:
 |---|---|---|---|
 | `apply` | containers with their own network (bridge, pasta, slirp4netns) | netem inside the container's network namespace, entered from the host with the host's `tc` | nothing for your own rootless containers; root for rootful ones |
 | `apply-host` | **host-network containers**, or any set of local ports | `flower` filters on a host interface pick out the target's ports and send only those packets through netem | root (`sudo`) |
-| `apply-vm` | **libvirt VMs** on a `network` or `bridge` interface | all traffic on the VM's host-side tap device (vnetN) goes through netem | root (`sudo`) |
+| `apply-vm` | **libvirt VMs** on a `network`, `bridge` or `direct` (macvtap) interface | all traffic on the VM's host-side tap or macvtap device goes through netem | root (`sudo`) |
 
-Status: an MVP (v0.3.0). The container and host modes are tested end to end on Fedora and on WSL2 (Microsoft's 6.6 kernel) with rootless Podman, and host mode has been used on live SIP calls between two host-network CallRaven containers through FreePBX ([results](docs/SPIKE-RESULTS.md#wsl2-and-live-callraven-test--the-pc-2026-11-25)). VM mode is tested on libvirt VMs (NAT network) under WSL2, including a VM restart. Docker has not been tested yet. Design and background: [`docs/DESIGN.md`](docs/DESIGN.md), [`docs/SPIKE-RESULTS.md`](docs/SPIKE-RESULTS.md).
+Status: an MVP (v0.3.0). The container and host modes are tested end to end on Fedora and on WSL2 (Microsoft's 6.6 kernel) with rootless Podman, and host mode has been used on live SIP calls between two host-network CallRaven containers through FreePBX ([results](docs/SPIKE-RESULTS.md#wsl2-and-live-callraven-test--the-pc-2026-11-25)). VM mode is tested on libvirt VMs under WSL2: tap and macvtap interfaces, VM-to-VM traffic, a VM restart and `--duration`. Docker has not been tested yet. Design and background: [`docs/DESIGN.md`](docs/DESIGN.md), [`docs/SPIKE-RESULTS.md`](docs/SPIKE-RESULTS.md).
 
 ## Requirements
 
@@ -175,7 +175,7 @@ sudo ./bin/wanshape clear-vm freepbx
 
 `--direction egress` is the VM's upload (what it sends), `ingress` its download. It uses the same engine as host mode: the VM's tap gets a `clsact` qdisc and a pair of IFBs, its root qdisc is untouched, and the state is kept in the kernel.
 
-- **Supported:** `network` and `bridge` interfaces (and `ethernet`), which use a tap device. **Not yet:** `direct` (macvtap) interfaces, which are refused until the direction of their tc hooks is measured, and `user`/passt networking (no host device; use `apply-host --ports` for the ports it forwards).
+- **Supported:** `network` and `bridge` interfaces (and `ethernet`), which use a tap device, and `direct` interfaces, which use a macvtap device (whose hooks run the other way round; wanshape handles that). Traffic between VMs on the same bridge or macvtap parent is shaped too. **Not supported:** `user`/passt networking, which has no host device; use `apply-host --ports` for the ports it forwards. A macvtap guest can't be reached from its own host (a macvtap limitation), so test it from another VM or machine.
 - **A VM restart loses the shaping**, because libvirt recreates the tap, often under a new name. `status` marks the target STALE; run `apply-vm` again, or let wanshape do it: `apply-vm --persist` records the VM's settings in `/etc/wanshape/vms.json`, and a libvirt hook installed once with `sudo wanshape install-vm-hook` (then restart `virtqemud` or `libvirtd`) re-applies them whenever libvirt starts the VM. `clear-vm` forgets them; `uninstall-vm-hook` removes the hook.
 - If the VM's interface has a libvirt `<bandwidth><outbound>` limit, libvirt has put an `ingress` qdisc on the tap that can't coexist with `clsact`, and wanshape refuses (exit 4).
 

@@ -4,9 +4,11 @@ A libvirt VM on a `network` or `bridge` interface (and `ethernet`) is
 connected by a tap device on the host, vnetN. wanshape shapes the whole tap
 through the host-mode engine (host.py, kind="vm").
 
-Not supported yet:
-- `direct` (macvtap): the device exists, but which tc hook carries which
-  direction hasn't been measured; refuse rather than guess.
+A `direct` interface is a macvtap device, also on the host. Its hooks run the
+other way round from a tap's (measured: docs/SPIKE-RESULTS.md), which the
+host-mode engine handles with `device="macvtap"`.
+
+Not supported:
 - `user` / passt (typical for qemu:///session): there is no host device; the
   VM's traffic leaves from host sockets, so `apply-host --ports` is the answer.
 """
@@ -22,6 +24,11 @@ from .errors import PrerequisiteError, UnsupportedTarget, WanshapeError
 
 DEFAULT_URI = "qemu:///system"
 TAP_TYPES = ("network", "bridge", "ethernet")
+MACVTAP_TYPES = ("direct",)
+
+
+def device_kind(iface_type: str) -> str:
+    return "macvtap" if iface_type in MACVTAP_TYPES else "tap"
 
 
 @dataclass
@@ -73,12 +80,7 @@ def choose_interface(domain: str, interfaces: Sequence[VmInterface],
             f"VM {domain!r} has {len(interfaces)} interfaces; pick one with --mac: "
             + ", ".join(f"{i.mac} ({i.type} {i.source})" for i in interfaces)
         )
-    if chosen.type == "direct":
-        raise UnsupportedTarget(
-            f"VM {domain!r} uses a direct (macvtap) interface on {chosen.source}; "
-            "VM mode supports tap interfaces (network, bridge) so far"
-        )
-    if chosen.type not in TAP_TYPES:
+    if chosen.type not in TAP_TYPES + MACVTAP_TYPES:
         raise UnsupportedTarget(
             f"VM {domain!r} uses a {chosen.type!r} interface with no host-side device; "
             "use `wanshape apply-host --ports ...` for the ports it forwards"
@@ -90,9 +92,10 @@ def choose_interface(domain: str, interfaces: Sequence[VmInterface],
 
 def check_tap_mac(device: str, guest_mac: str,
                   run: Callable[[list[str]], str] | None = None) -> None:
-    """libvirt gives the tap the guest's MAC with the first byte set to fe.
+    """libvirt gives a tap the guest's MAC with the first byte set to fe; a
+    macvtap device has the guest's MAC itself.
 
-    Checking it guards against a vnetN name that now belongs to another VM.
+    Checking it guards against a vnetN/macvtapN name that now belongs to another VM.
     """
     run = run or (lambda args: subprocess.run(args, text=True, capture_output=True).stdout)
     try:

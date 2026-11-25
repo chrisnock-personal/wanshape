@@ -46,9 +46,11 @@ def _save(data: dict) -> None:
     os.replace(tmp, CONFIG)
 
 
-def remember(domain: str, profile: Profile, direction: str, mac: str) -> None:
+def remember(domain: str, profile: Profile, direction: str, mac: str,
+             device: str = "tap") -> None:
     data = load()
-    data[domain] = {"profile": asdict(profile), "direction": direction, "mac": mac.lower()}
+    data[domain] = {"profile": asdict(profile), "direction": direction, "mac": mac.lower(),
+                    "device": device}
     _save(data)
 
 
@@ -114,7 +116,8 @@ def run_hook(domain: str, operation: str, sub_operation: str, xml_text: str,
         device = tap_from_xml(xml_text, entry["mac"])
         if not device:
             raise WanshapeError(f"no interface with MAC {entry['mac']} in the domain XML")
-        apply_fn(domain, profile_from(entry), entry["direction"], device)
+        apply_fn(domain, profile_from(entry), entry["direction"], device,
+                 entry.get("device", "tap"))
         return f"re-applied to {device}"
     if (operation, sub_operation) == ("release", "end"):
         release_fn(domain)
