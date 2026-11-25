@@ -175,3 +175,20 @@ its tap; `apply-vm` then refused with exit 4 as designed. Nothing was left on th
 
 Not measured: VM-to-VM traffic across the bridge. CirrOS's SSH server never came up on VM2, and a
 login over its serial console got no answer; tracked as an issue.
+
+# Loss on the way out: TCP and UDP — laptop, 2026-11-25
+
+Design §2.6 worried that netem loss applied to a host's own outgoing traffic is reported back to the
+sending socket, so TCP would resend at once and barely notice. Measured with iperf3 across a veth pair
+in a private namespace (kernel 7.3), 4 mbit/s cap, 6 s per test, two runs:
+
+| 3% loss applied | TCP received | TCP retransmits | UDP lost (1 mbit/s, ~520 packets) |
+|---|---|---|---|
+| nowhere | 3.75-3.80 mbit/s | 0 | 0.0% |
+| on the sender's way out (wanshape's "up") | 3.65-3.74 mbit/s | 45-108 | 2.1-2.5% |
+| on the receiver's way in (IFB at the receiver) | 3.64-3.65 mbit/s | 49-57 | 3.3-4.4% |
+
+TCP retransmits as much with the loss on the sender's side as at the receiver, and throughput is the
+same, so the drop is not masked: netem on current kernels doesn't report it to the socket. UDP loses
+about the configured share either way (the runs are short, so the figures are noisy). No caveat is
+needed in `show` or `status`.

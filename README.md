@@ -166,7 +166,7 @@ sudo ./bin/wanshape clear-vm freepbx
 - A rootful container needs root (`sudo`); the sidecar backend for non-root Docker users is designed but not built.
 - Shaping is lost when a container restarts (its network namespace goes away). `status` reports such entries as stale.
 - `--duration` (automatic clear) is not implemented.
-- Loss applied to outgoing TCP is reported to the local TCP stack, which resends at once; for realistic TCP loss, shape the download direction. UDP (RTP, SIP) behaves as expected both ways.
+- Loss on outgoing traffic behaves like real network loss for both TCP and UDP: measured, TCP retransmitted about as much as with the same loss at the receiver, and UDP lost about the configured share ([measurement](docs/SPIKE-RESULTS.md#loss-on-the-way-out-tcp-and-udp--laptop-2026-11-25)).
 
 ## Tests
 
