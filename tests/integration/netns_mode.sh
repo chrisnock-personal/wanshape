@@ -130,6 +130,16 @@ ws clear ws-it-a > /dev/null
 systemctl --user list-timers --all | grep -q wanshape-clear-container-ws-it-a && fail "clear left the timer"
 echo "ok   --duration clears by itself, and clear cancels the timer"
 
+echo "# several targets (#6)"
+ws apply ws-it-a,ws-it-b --delay 15ms > /dev/null
+expect "both ends shaped: 15 ms x 2 ends x 2 ways" ws-it-b "$A_IP" 9999 55 85
+set +e; ws apply ws-it-a no-such-container --delay 40ms > /dev/null 2>&1; code=$?; set -e
+[ "$code" -ne 0 ] || fail "unknown name in a list was accepted"
+expect "unknown name: nothing changed" ws-it-b "$A_IP" 9999 55 85
+ws clear ws-it-a ws-it-b > /dev/null
+expect "both cleared" ws-it-b "$A_IP" 9999 0 10
+echo "ok   several containers in one command, checked before any change"
+
 echo "# pasta (rootless default)"
 python3 -c "$ECHO_PY" 39999 &
 ECHO=$!

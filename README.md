@@ -77,6 +77,20 @@ loss_model = "gemodel 1% 25% 100% 0%"
 rate = "2mbit"
 ```
 
+## Several targets at once
+
+Every command takes one or more targets, separated by spaces or commas:
+
+```sh
+wanshape apply web api worker --profile 3g
+sudo ./bin/wanshape apply-host callraven,callraven-agent --profile lossy-sip
+sudo ./bin/wanshape apply-vm pbx sbc --profile satellite
+wanshape status web api
+wanshape clear web,api,worker
+```
+
+wanshape resolves and plans every target before it changes anything, so an unknown name, a stopped container or a clash between two targets in the list stops the command with nothing changed. If applying one target then fails, the ones already done are undone too; `--keep-going` keeps them instead. Containers in the list that share a network namespace are shaped once. For host mode, `--ports`, `--remote-ports` and `--peer` describe a single target; with several names, each container's ports come from its own label or environment.
+
 ## Per-container mode: `apply`
 
 ```sh

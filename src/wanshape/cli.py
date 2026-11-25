@@ -53,7 +53,8 @@ def _parser() -> argparse.ArgumentParser:
     show.add_argument("profile")
 
     apply_cmd = sub.add_parser("apply", help="apply a profile to a container")
-    apply_cmd.add_argument("container")
+    apply_cmd.add_argument("container", nargs="+",
+                           help="one or more containers (space- or comma-separated)")
     _add_profile_args(apply_cmd)
     apply_cmd.add_argument("--runtime", choices=("podman", "docker"))
     apply_cmd.add_argument("--iface", help="override the resolved interface")
@@ -70,7 +71,8 @@ def _parser() -> argparse.ArgumentParser:
         "*PORT_LOW/HIGH environment variables; --ports overrides that, and then NAME is "
         "only a label and needs no container.",
     )
-    host.add_argument("name", help="host-network container, or a label when --ports is given")
+    host.add_argument("name", nargs="+",
+                      help="host-network container(s), or a label when --ports is given")
     _add_profile_args(host)
     host.add_argument("--ports", help="local ports to shape, e.g. 5060,10000-20000 (UDP and TCP)")
     host.add_argument("--remote-ports", metavar="PORTS",
@@ -91,7 +93,7 @@ def _parser() -> argparse.ArgumentParser:
         "(vnetN). Delay and loss apply to traffic to and from the VM, including other "
         "VMs on the same bridge. The shaping is lost when the VM restarts; apply again.",
     )
-    vm.add_argument("domain", help="libvirt domain name")
+    vm.add_argument("domain", nargs="+", help="libvirt domain name(s)")
     _add_profile_args(vm)
     vm.add_argument("--connect", "-c", default="qemu:///system", metavar="URI",
                     help="libvirt URI (default qemu:///system)")
@@ -99,13 +101,12 @@ def _parser() -> argparse.ArgumentParser:
 
     clear_host = sub.add_parser("clear-host", aliases=["clear-vm"],
                                 help="remove host-mode or VM shaping")
-    target_group = clear_host.add_mutually_exclusive_group(required=True)
-    target_group.add_argument("name", nargs="?")
-    target_group.add_argument("--all", action="store_true", help="clear every host-mode target")
+    clear_host.add_argument("name", nargs="*", help="target name(s)")
+    clear_host.add_argument("--all", action="store_true", help="clear every host-mode target")
     clear_host.add_argument("--dry-run", action="store_true")
 
     status = sub.add_parser("status", help="show live shaping state")
-    status.add_argument("container", nargs="?")
+    status.add_argument("container", nargs="*", help="limit to these targets")
     status.add_argument("--all", action="store_true",
                         help="also scan every running container for wanshape shaping, "
                         "including any the state file doesn't know about")
@@ -113,7 +114,7 @@ def _parser() -> argparse.ArgumentParser:
                         help="drop state entries for containers that are gone or recreated")
 
     clear = sub.add_parser("clear", help="remove wanshape's qdiscs")
-    clear.add_argument("container")
+    clear.add_argument("container", nargs="+")
     clear.add_argument("--direction", choices=("egress", "ingress", "both"), default="both")
     clear.add_argument("--runtime", choices=("podman", "docker"))
     clear.add_argument("--iface")
@@ -148,6 +149,9 @@ def _add_profile_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-reorder", action="store_true",
                         help="attach pfifo under netem to prevent jitter reordering")
     parser.add_argument("--dry-run", action="store_true", help="print commands only")
+    parser.add_argument("--keep-going", action="store_true",
+                        help="with several targets: if one fails, keep the others "
+                        "(default: undo them all)")
     parser.add_argument("--duration", metavar="TIME",
                         help="clear automatically after this long, e.g. 90s, 5m, 1h "
                         "(a one-shot systemd timer)")
@@ -220,50 +224,41 @@ class _Commands:
     def apply(args: argparse.Namespace) -> int:
         seconds = _duration(args)
         profile = _profile_from_args(args)
-        target = resolve(args.container, args.runtime, args.iface)
-        backend = get_backend(target, args.backend)
-        target.verify()
-        live = inspect_live(backend, target.iface)
-        plan = build_apply_plan(profile, target.iface, args.direction, live, args.force)
-        _print_plan(plan, backend, target)
-        members = netns_members(target)
-        if members:
-            print(f"# {target.name} shares its network namespace with {', '.join(members)}: "
-                  "they are shaped too", file=sys.stderr)
-
+        names = _names(args.container)
+        # Resolve and plan every target before changing anything.
+        preps = []
+        seen: dict[int, str] = {}
+        for name in names:
+            target = resolve(name, args.runtime, args.iface)
+            backend = get_backend(target, args.backend)
+            target.verify()
+            if target.netns_inode in seen:
+                print(f"# {target.name} shares a network namespace with {seen[target.netns_inode]}"
+                      ": shaped once", file=sys.stderr)
+                continue
+            seen[target.netns_inode] = target.name
+            live = inspect_live(backend, target.iface)
+            plan = build_apply_plan(profile, target.iface, args.direction, live, args.force)
+            _print_plan(plan, backend, target)
+            members = [m for m in netns_members(target) if m not in names]
+            if members:
+                print(f"# {target.name} shares its network namespace with {', '.join(members)}: "
+                      "they are shaped too", file=sys.stderr)
+            preps.append((target, backend, live, plan))
         if args.dry_run:
             return 0
-        applied: list[str] = []
-        failure: tuple[str, CommandError] | None = None
-        for group in ("egress", "ingress"):
-            if not getattr(plan, group):
+        done, failed = [], []
+        for prep in preps:
+            if _apply_container(prep, args, profile, seconds):
+                done.append(prep)
                 continue
-            try:
-                for command in getattr(plan, group):
-                    target.verify()
-                    backend.run(command)
-            except CommandError as exc:
-                failure = (group, exc)
-                break
-            applied.append(group)
-        if failure:
-            failed_group, error = failure
-            print(f"wanshape: {failed_group} shaping failed: {error}", file=sys.stderr)
-            if applied and args.allow_partial:
-                _save_and_report(target, profile.name, "+".join(applied), live, plan,
-                                 partial=True)
-                print(f"wanshape: {'+'.join(applied)} remains active; run `wanshape clear {target.name}`",
-                      file=sys.stderr)
-            else:
-                _rollback(target, backend, plan)
-            return EXIT_ERROR
-        unit = timer.unit_name("container", target.name)
-        if seconds:
-            timer.schedule(unit, seconds, ["clear", target.id, "--runtime", target.runtime])
-        else:
-            timer.cancel(unit)
-        return _save_and_report(target, profile.name, args.direction, live, plan,
-                                until=timer.until(seconds) if seconds else None)
+            failed.append(prep[0].name)
+            if not args.keep_going:
+                for target, backend, _, plan in reversed(done):
+                    _rollback(target, backend, plan)
+                    timer.cancel(timer.unit_name("container", target.name))
+                return EXIT_ERROR
+        return _summary([p[0].name for p in done], failed)
 
     @staticmethod
     def status(args: argparse.Namespace) -> int:
@@ -272,14 +267,17 @@ class _Commands:
             _prune(entries)
             entries = load_state()
         targets: list[tuple[Target, dict | None]] = []
-        if args.container:
-            try:
-                target = resolve(args.container)
-                targets.append((target, _entry_for(entries, target)))
-            except WanshapeError:
-                # Host-network containers and --ports labels live in host mode only.
-                if not inspect_host(HostBackend()).by_name(args.container):
-                    raise
+        names = _names(args.container)
+        if names:
+            host_names = {s.name for s in inspect_host(HostBackend()).slots.values()}
+            for name in names:
+                try:
+                    target = resolve(name)
+                    targets.append((target, _entry_for(entries, target)))
+                except WanshapeError:
+                    # Host-network containers and --ports labels live in host mode only.
+                    if name not in host_names:
+                        raise
         else:
             for entry in entries.values():
                 target = None
@@ -308,7 +306,7 @@ class _Commands:
         host_live = inspect_host(host_backend)
         host_slots = [
             slot for slot in sorted(host_live.slots.values(), key=lambda x: x.slot)
-            if not args.container or slot.name == args.container
+            if not names or slot.name in names
         ]
         for slot in host_slots:
             gone = not host_live.iface(slot.iface).exists
@@ -324,7 +322,7 @@ class _Commands:
         for target, entry in targets:
             backend = get_backend(target)
             live = inspect_live(backend, target.iface)
-            if entry is None and args.all and not args.container and not (
+            if entry is None and args.all and not names and not (
                     live.egress or live.ingress):
                 continue  # scanned and not shaped: not worth a line
             shown += 1
@@ -344,89 +342,195 @@ class _Commands:
 
     @staticmethod
     def clear(args: argparse.Namespace) -> int:
-        target = resolve(args.container, args.runtime, args.iface)
-        backend = get_backend(target, "auto")
-        entry = _entry_for(load_state(), target) or {}
-        target.verify()
-        live = inspect_live(backend, target.iface)
-        plan = build_clear_plan(
-            target.iface, args.direction, live, bool(entry.get("added_clsact")),
-            entry.get("prior_root_qdisc"),
-        )
-        if plan.empty:
-            print(f"{target.name}: nothing to clear")
-            return 0
-        _print_plan(plan, backend, target)
-        if args.dry_run:
-            return 0
-        for command in plan.commands:
-            target.verify()
-            backend.run(command)
-        timer.cancel(timer.unit_name("container", target.name))
-        entries = load_state()
-        for key in [k for k, e in entries.items()
-                    if k == target.id or e.get("netns_inode") == target.netns_inode]:
-            entries.pop(key)
-        save_state(entries)
-        print(f"{target.name}: cleared; state removed")
+        targets = [resolve(name, args.runtime, args.iface) for name in _names(args.container)]
+        for target in targets:
+            _clear_container(target, args)
         return 0
+
+
+def _clear_container(target: Target, args: argparse.Namespace) -> None:
+    """Clear one container target (any member of a shared namespace)."""
+    backend = get_backend(target, "auto")
+    entry = _entry_for(load_state(), target) or {}
+    target.verify()
+    live = inspect_live(backend, target.iface)
+    plan = build_clear_plan(
+        target.iface, args.direction, live, bool(entry.get("added_clsact")),
+        entry.get("prior_root_qdisc"),
+    )
+    if plan.empty:
+        print(f"{target.name}: nothing to clear")
+        return
+    _print_plan(plan, backend, target)
+    if args.dry_run:
+        return
+    for command in plan.commands:
+        target.verify()
+        backend.run(command)
+    timer.cancel(timer.unit_name("container", target.name))
+    entries = load_state()
+    for key in [k for k, e in entries.items()
+                if k == target.id or e.get("netns_inode") == target.netns_inode]:
+        entries.pop(key)
+    save_state(entries)
+    print(f"{target.name}: cleared; state removed")
+
+
+def _apply_container(prep, args: argparse.Namespace, profile: Profile,
+                     seconds: int | None) -> bool:
+    """Apply one planned container target; False if it failed (and was handled)."""
+    target, backend, live, plan = prep
+    applied: list[str] = []
+    failure: tuple[str, CommandError] | None = None
+    for group in ("egress", "ingress"):
+        if not getattr(plan, group):
+            continue
+        try:
+            for command in getattr(plan, group):
+                target.verify()
+                backend.run(command)
+        except CommandError as exc:
+            failure = (group, exc)
+            break
+        applied.append(group)
+    if failure:
+        failed_group, error = failure
+        print(f"wanshape: {target.name}: {failed_group} shaping failed: {error}", file=sys.stderr)
+        if applied and args.allow_partial:
+            _save_and_report(target, profile.name, "+".join(applied), live, plan, partial=True)
+            print(f"wanshape: {'+'.join(applied)} remains active; run `wanshape clear "
+                  f"{target.name}`", file=sys.stderr)
+        else:
+            _rollback(target, backend, plan)
+        return False
+    unit = timer.unit_name("container", target.name)
+    if seconds:
+        timer.schedule(unit, seconds, ["clear", target.id, "--runtime", target.runtime])
+    else:
+        timer.cancel(unit)
+    _save_and_report(target, profile.name, args.direction, live, plan,
+                     until=timer.until(seconds) if seconds else None)
+    return True
+
+
+def _names(values) -> list[str]:
+    """Targets from positional arguments: space- and/or comma-separated, deduplicated."""
+    if isinstance(values, str):
+        values = [values]
+    names: list[str] = []
+    for value in values or []:
+        for name in str(value).split(","):
+            name = name.strip()
+            if name and name not in names:
+                names.append(name)
+    return names
+
+
+def _summary(done: list[str], failed: list[str]) -> int:
+    if failed:
+        print(f"wanshape: failed: {', '.join(failed)}"
+              + (f"; applied: {', '.join(done)}" if done else ""), file=sys.stderr)
+        return EXIT_ERROR
+    return 0
+
+
+def _simulate(live, plan) -> None:
+    """Record a planned host/VM target in `live`, so later targets plan around it."""
+    slot = plan.slot
+    live.slots = {k: v for k, v in live.slots.items() if v.name != slot.name}
+    live.slots[slot.slot] = slot
+    live.ifbs |= {slot.up, slot.down}
+    state = live.iface(slot.iface)
+    state.clsact = True
+    for command in plan.commands:
+        if command[:3] == ["tc", "filter", "add"]:
+            state.prefs(command[5]).add(int(command[7]))
+
+
+def _run_host_plans(backend, plans, args: argparse.Namespace, profile: Profile,
+                    seconds: int | None) -> int:
+    """Apply planned host/VM targets in order; all or nothing unless --keep-going."""
+    require_root()
+    done, failed = [], []
+    for name, plan in plans:
+        try:
+            run_plan(backend, plan.commands, plan.rollback)
+        except CommandError as exc:
+            print(f"wanshape: {name}: failed and was rolled back: {exc}", file=sys.stderr)
+            failed.append(name)
+            if not args.keep_going:
+                for done_name, done_plan in reversed(done):
+                    live = inspect_host(backend)
+                    slot = live.by_name(done_name)
+                    if slot:
+                        for command in build_host_clear(slot, live):
+                            backend.run_result(command)
+                    timer.cancel(timer.unit_name(done_plan.slot.kind, done_name))
+                    print(f"wanshape: {done_name}: undone (use --keep-going to keep "
+                          "the targets that worked)", file=sys.stderr)
+                return EXIT_ERROR
+            continue
+        _host_timer(plan.slot.kind, name, seconds)
+        print(f"{name}: applied {profile.name} to {args.direction} on {plan.slot.iface}"
+              + (f" {plan.slot.describe()}" if plan.slot.describe() else ""))
+        done.append((name, plan))
+    return _summary([n for n, _ in done], failed)
 
 
 def _apply_host(args: argparse.Namespace) -> int:
     seconds = _duration(args)
     profile = _profile_from_args(args)
-    remote = (parse_ports(args.remote_ports) if args.remote_ports
-              else remote_ports_from_container(args.name, args.runtime))
-    ports, source = host_ports_for(args.name, args.runtime, args.ports,
-                                   optional=bool(remote or args.peer))
+    names = _names(args.name)
+    if len(names) > 1 and (args.ports or args.remote_ports or args.peer):
+        raise WanshapeError(
+            "--ports, --remote-ports and --peer describe one target: give one name, or "
+            "label each container (wanshape.ports, wanshape.remote_ports)")
     backend = HostBackend()
     iface = resolve_host_iface(backend, args.iface, args.via or args.peer)
     live = inspect_host(backend, [iface])
-    plan = build_host_apply(args.name, profile, ports, iface, args.direction, live,
-                            remote_ports=remote, peer=args.peer,
-                            until=timer.until(seconds) if seconds else None)
-    print(f"# host target: {args.name}, {plan.slot.describe()} (local ports from {source})")
-    print(f"# iface {iface}, slot {plan.slot.slot}, {args.direction}")
-    for command in plan.commands:
-        print("+ " + shlex.join(command))
+    plans = []
+    for name in names:
+        remote = (parse_ports(args.remote_ports) if args.remote_ports
+                  else remote_ports_from_container(name, args.runtime))
+        ports, source = host_ports_for(name, args.runtime, args.ports,
+                                       optional=bool(remote or args.peer))
+        plan = build_host_apply(name, profile, ports, iface, args.direction, live,
+                                remote_ports=remote, peer=args.peer,
+                                until=timer.until(seconds) if seconds else None)
+        print(f"# host target: {name}, {plan.slot.describe()} (local ports from {source})")
+        print(f"# iface {iface}, slot {plan.slot.slot}, {args.direction}")
+        for command in plan.commands:
+            print("+ " + shlex.join(command))
+        _simulate(live, plan)
+        plans.append((name, plan))
     if args.dry_run:
         return 0
-    require_root()
-    try:
-        run_plan(backend, plan.commands, plan.rollback)
-    except CommandError as exc:
-        print(f"wanshape: apply-host failed and was rolled back: {exc}", file=sys.stderr)
-        return EXIT_ERROR
-    _host_timer("ports", args.name, seconds)
-    print(f"{args.name}: applied {profile.name} to {args.direction} on {iface} "
-          f"{plan.slot.describe()}")
-    return 0
+    return _run_host_plans(backend, plans, args, profile, seconds)
 
 
 def _apply_vm(args: argparse.Namespace) -> int:
     seconds = _duration(args)
     profile = _profile_from_args(args)
-    iface = resolve_vm(args.domain, args.connect, args.mac)
+    names = _names(args.domain)
+    if len(names) > 1 and args.mac:
+        raise WanshapeError("--mac picks one VM's interface: give one VM with it")
+    vms = [(name, resolve_vm(name, args.connect, args.mac)) for name in names]
     backend = HostBackend()
-    live = inspect_host(backend, [iface.device])
-    plan = build_host_apply(args.domain, profile, [], iface.device, args.direction, live,
-                            kind="vm", until=timer.until(seconds) if seconds else None)
-    print(f"# VM: {args.domain}, {iface.type} {iface.source}, MAC {iface.mac}")
-    print(f"# host device {iface.device}, slot {plan.slot.slot}, {args.direction} "
-          "(egress = from the VM)")
-    for command in plan.commands:
-        print("+ " + shlex.join(command))
+    live = inspect_host(backend, [iface.device for _, iface in vms])
+    plans = []
+    for name, iface in vms:
+        plan = build_host_apply(name, profile, [], iface.device, args.direction, live,
+                                kind="vm", until=timer.until(seconds) if seconds else None)
+        print(f"# VM: {name}, {iface.type} {iface.source}, MAC {iface.mac}")
+        print(f"# host device {iface.device}, slot {plan.slot.slot}, {args.direction} "
+              "(egress = from the VM)")
+        for command in plan.commands:
+            print("+ " + shlex.join(command))
+        _simulate(live, plan)
+        plans.append((name, plan))
     if args.dry_run:
         return 0
-    require_root()
-    try:
-        run_plan(backend, plan.commands, plan.rollback)
-    except CommandError as exc:
-        print(f"wanshape: apply-vm failed and was rolled back: {exc}", file=sys.stderr)
-        return EXIT_ERROR
-    _host_timer("vm", args.domain, seconds)
-    print(f"{args.domain}: applied {profile.name} to {args.direction} on {iface.device}")
-    return 0
+    return _run_host_plans(backend, plans, args, profile, seconds)
 
 
 def _duration(args: argparse.Namespace) -> int | None:
@@ -451,18 +555,26 @@ def _host_timer(kind: str, name: str, seconds: int | None) -> None:
 def _clear_host(args: argparse.Namespace) -> int:
     backend = HostBackend()
     live = inspect_host(backend)
+    names = _names(args.name)
+    if args.all == bool(names):
+        raise WanshapeError("give target name(s) or --all")
     if args.all:
         slots = sorted(live.slots.values(), key=lambda x: x.slot)
     else:
-        slot = live.by_name(args.name)
-        if not slot:
-            print(f"{args.name}: no host-mode shaping found")
+        slots = []
+        for name in names:
+            slot = live.by_name(name)
+            if slot:
+                slots.append(slot)
+            else:
+                print(f"{name}: no host-mode shaping found")
+        if not slots:
             return 0
-        slots = [slot]
     if not slots:
         print("no host-mode shaping found")
         return 0
     for slot in slots:
+        slot = live.by_name(slot.name) or slot
         commands = build_host_clear(slot, live)
         for command in commands:
             print("+ " + shlex.join(command))

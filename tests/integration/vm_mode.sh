@@ -30,6 +30,7 @@ cat > "$WORK/bin/virsh" <<EOF
 #!/bin/sh
 # Stand-in for: virsh -c URI -q domiflist testvm
 case "\$*" in
+    *"domiflist testvm2"*) echo " vnet1   network   default   virtio   52:54:00:12:34:57" ;;
     *"domiflist testvm"*) echo " vnet0   network   default   virtio   $MAC" ;;
     *) echo "error: failed to get domain" >&2; exit 1 ;;
 esac
@@ -92,6 +93,18 @@ echo "ok   refuses to fight libvirt's own ingress qdisc"
 set +e; ws apply-vm nosuchvm --delay 10ms > /dev/null 2>&1; code=$?; set -e
 [ "$code" -eq 1 ] || fail "unknown VM gave exit $code"
 echo "ok   unknown VM refused"
+
+# Several VMs in one command (#6). testvm2 is a bare tap with no guest.
+ip tuntap add vnet1 mode tap
+ip link set vnet1 address fe:54:00:12:34:57
+ip link set vnet1 master br0
+ip link set vnet1 up
+ws apply-vm testvm,testvm2 --delay 30ms > /dev/null
+[ "$(ws status | grep -c 'vm mode')" -eq 2 ] || fail "two VM targets expected"
+ws status | grep -q "testvm2: vm mode, device=vnet1" || fail "testvm2 not on vnet1"
+ws clear-vm testvm testvm2 > /dev/null
+ip link show type ifb | grep -q wsh && fail "IFBs left after clearing two VMs"
+echo "ok   two VMs in one command, cleared together"
 
 # A VM restart recreates the tap under a new name: the old target goes stale.
 ws apply-vm testvm --delay 20ms > /dev/null

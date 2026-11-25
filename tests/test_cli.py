@@ -23,7 +23,7 @@ def args(**overrides) -> argparse.Namespace:
         container="test", profile=None, delay="10ms", jitter=None, loss=None,
         loss_model=None, rate=None, runtime=None, iface=None, direction="both",
         no_reorder=False, backend="nsenter", dry_run=False, force=False,
-        duration=None, allow_partial=False, distribution=None,
+        duration=None, allow_partial=False, distribution=None, keep_going=False,
     )
     values.update(overrides)
     return argparse.Namespace(**values)
