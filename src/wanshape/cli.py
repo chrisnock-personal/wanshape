@@ -373,7 +373,7 @@ def _clear_host(args: argparse.Namespace) -> int:
             continue
         require_root()
         run_plan(backend, commands)
-        print(f"{slot.name}: cleared host-mode shaping on {slot.iface}")
+        print(f"{slot.name}: cleared {slot.kind} shaping on {slot.iface}")
         # Later slots must see this one gone (e.g. to decide on removing clsact).
         live = inspect_host(backend)
     return 0

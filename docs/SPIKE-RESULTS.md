@@ -154,3 +154,24 @@ Not covered yet: a libvirt-managed VM under sudo (resolution was checked against
 `virsh domiflist` on the laptop, whose FreePBX VM is `direct` and correctly refused); `direct`
 (macvtap) interfaces, whose hook directions need measuring as root; VM-to-VM traffic across the bridge
 (expected to be shaped, since the bridge sends to the tap through the same egress hook, not measured).
+
+## VM mode on libvirt — the PC, 2026-11-25
+
+Two throwaway CirrOS VMs (`wanshape-test1/2`, 256 MB) on libvirt's `default` NAT network under WSL2,
+created with `virt-install`, shaped with `sudo ./bin/wanshape apply-vm` (real `virsh` lookup and tap MAC
+check), and removed afterwards with their disks.
+
+| Step | ping host -> VM1 |
+|---|---|
+| baseline | 0.47 ms |
+| `--delay 40ms` | 80.5 ms |
+| `3g` | 284 ms |
+| VM1 destroyed and started: tap `vnet0` -> `vnet2`; `status` reports STALE; re-applied `--delay 25ms` | 50.5 ms |
+| `clear-vm` | 0.36 ms |
+
+100% loss per direction dropped the host's pings on the expected IFB (`--direction egress` on
+`wsh0up`, `ingress` on `wsh0dn`). `virsh domiftune --outbound 1000` on VM2 added an `ingress` qdisc to
+its tap; `apply-vm` then refused with exit 4 as designed. Nothing was left on the taps or as IFBs.
+
+Not measured: VM-to-VM traffic across the bridge. CirrOS's SSH server never came up on VM2, and a
+login over its serial console got no answer; tracked as an issue.

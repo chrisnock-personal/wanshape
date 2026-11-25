@@ -10,7 +10,7 @@ Two modes:
 | `apply-host` | **host-network containers**, or any set of local ports | `flower` filters on a host interface pick out the target's ports and send only those packets through netem | root (`sudo`) |
 | `apply-vm` | **libvirt VMs** on a `network` or `bridge` interface | all traffic on the VM's host-side tap device (vnetN) goes through netem | root (`sudo`) |
 
-Status: an MVP (v0.3.0). The container and host modes are tested end to end on Fedora and on WSL2 (Microsoft's 6.6 kernel) with rootless Podman, and host mode has been used on live SIP calls between two host-network CallRaven containers through FreePBX ([results](docs/SPIKE-RESULTS.md#wsl2-and-live-callraven-test--the-pc-2026-11-25)). VM mode is tested with a real KVM guest on a tap device in a private namespace, but not yet on a libvirt-managed VM. Docker has not been tested yet. Design and background: [`docs/DESIGN.md`](docs/DESIGN.md), [`docs/SPIKE-RESULTS.md`](docs/SPIKE-RESULTS.md).
+Status: an MVP (v0.3.0). The container and host modes are tested end to end on Fedora and on WSL2 (Microsoft's 6.6 kernel) with rootless Podman, and host mode has been used on live SIP calls between two host-network CallRaven containers through FreePBX ([results](docs/SPIKE-RESULTS.md#wsl2-and-live-callraven-test--the-pc-2026-11-25)). VM mode is tested on libvirt VMs (NAT network) under WSL2, including a VM restart. Docker has not been tested yet. Design and background: [`docs/DESIGN.md`](docs/DESIGN.md), [`docs/SPIKE-RESULTS.md`](docs/SPIKE-RESULTS.md).
 
 ## Requirements
 
