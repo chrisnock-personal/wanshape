@@ -8,8 +8,9 @@ Two modes:
 |---|---|---|---|
 | `apply` | containers with their own network (bridge, pasta, slirp4netns) | netem inside the container's network namespace, entered from the host with the host's `tc` | nothing for your own rootless containers; root for rootful ones |
 | `apply-host` | **host-network containers**, or any set of local ports | `flower` filters on a host interface pick out the target's ports and send only those packets through netem | root (`sudo`) |
+| `apply-vm` | **libvirt VMs** on a `network` or `bridge` interface | all traffic on the VM's host-side tap device (vnetN) goes through netem | root (`sudo`) |
 
-Status: an MVP (v0.2.0). Both modes are tested end to end on Fedora and on WSL2 (Microsoft's 6.6 kernel) with rootless Podman, and host mode has been used on live SIP calls between two host-network CallRaven containers through FreePBX ([results](docs/SPIKE-RESULTS.md#wsl2-and-live-callraven-test--the-pc-2026-11-25)). Docker has not been tested yet. Design and background: [`docs/DESIGN.md`](docs/DESIGN.md), [`docs/SPIKE-RESULTS.md`](docs/SPIKE-RESULTS.md).
+Status: an MVP (v0.3.0). The container and host modes are tested end to end on Fedora and on WSL2 (Microsoft's 6.6 kernel) with rootless Podman, and host mode has been used on live SIP calls between two host-network CallRaven containers through FreePBX ([results](docs/SPIKE-RESULTS.md#wsl2-and-live-callraven-test--the-pc-2026-11-25)). VM mode is tested with a real KVM guest on a tap device in a private namespace, but not yet on a libvirt-managed VM. Docker has not been tested yet. Design and background: [`docs/DESIGN.md`](docs/DESIGN.md), [`docs/SPIKE-RESULTS.md`](docs/SPIKE-RESULTS.md).
 
 ## Requirements
 
@@ -119,6 +120,25 @@ Things to know:
 - wanshape adds a `clsact` qdisc to the interface if there isn't one and removes it when the last host target is cleared, unless another tool has filters there.
 - Host mode keeps no state file. Each target's settings are stored in the alias of its `wsh<N>up` IFB device, so `status` and `clear-host` read them from the kernel.
 
+## VM mode: `apply-vm`
+
+Shapes everything a libvirt VM sends and receives on one interface, including traffic to other VMs on the same bridge. wanshape asks libvirt which host device the VM uses (`virsh domiflist`) and checks that the device's MAC is the one libvirt gives that VM's tap.
+
+```sh
+sudo ./bin/wanshape apply-vm freepbx --profile lossy-sip --dry-run
+sudo ./bin/wanshape apply-vm freepbx --profile lossy-sip
+sudo ./bin/wanshape apply-vm web --mac 52:54:00:aa:bb:02 --delay 80ms   # VM with several NICs
+sudo ./bin/wanshape apply-vm devbox -c qemu:///session --delay 50ms     # another libvirt URI
+wanshape status
+sudo ./bin/wanshape clear-vm freepbx
+```
+
+`--direction egress` is the VM's upload (what it sends), `ingress` its download. It uses the same engine as host mode: the VM's tap gets a `clsact` qdisc and a pair of IFBs, its root qdisc is untouched, and the state is kept in the kernel.
+
+- **Supported:** `network` and `bridge` interfaces (and `ethernet`), which use a tap device. **Not yet:** `direct` (macvtap) interfaces, which are refused until the direction of their tc hooks is measured, and `user`/passt networking (no host device; use `apply-host --ports` for the ports it forwards).
+- **A VM restart loses the shaping**, because libvirt recreates the tap, often under a new name. `status` marks the target STALE; run `apply-vm` again.
+- If the VM's interface has a libvirt `<bandwidth><outbound>` limit, libvirt has put an `ingress` qdisc on the tap that can't coexist with `clsact`, and wanshape refuses (exit 4).
+
 ## Exit codes
 
 0 success, 1 error, 2 unsupported target (e.g. `apply` on a host-network container), 3 prerequisite missing (e.g. host mode without root), 4 conflict (another tool's tc state, or overlapping host targets).
@@ -138,6 +158,7 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v   # unit tests, no privi
 
 sh tests/integration/host_mode.sh     # host mode on a veth pair in a private user+net namespace; no root needed
 sh tests/integration/netns_mode.sh    # rootless Podman bridge, pasta and keep-id containers; needs the python:3.12-slim image
+WANSHAPE_VM_IMAGE=cirros-0.6.2-x86_64-disk.img sh tests/integration/vm_mode.sh   # KVM guest on a tap, no root
 ```
 
 The integration tests measure real round-trip times with and without shaping, and check that everything is removed afterwards.

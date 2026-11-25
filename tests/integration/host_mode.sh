@@ -102,7 +102,7 @@ echo "ok   overlapping ports refused"
 
 ws apply-host sip-b --ports 42000 --iface h0 --profile 4g > /dev/null
 expect "second target" udp 42000 30 80           # 25 ms each way, 10 ms jitter
-ws status | grep -q "sip-b: host mode, profile=4g" || fail "status does not show sip-b"
+ws status | grep -q "sip-b: host mode, .*profile=4g" || fail "status does not show sip-b"
 echo "ok   status lists both targets"
 
 ws clear-host sip-a > /dev/null

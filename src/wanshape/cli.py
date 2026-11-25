@@ -28,6 +28,7 @@ from .planner import build_apply_plan, build_clear_plan
 from .profiles import Direction, Profile, ProfileError, load_profiles
 from .state import load_state, make_entry, save_state
 from .target import Target, resolve
+from .vm import resolve_vm
 
 EXIT_ERROR = 1
 EXIT_UNSUPPORTED = 2
@@ -73,7 +74,21 @@ def _parser() -> argparse.ArgumentParser:
     where.add_argument("--via", metavar="ADDRESS",
                        help="use the interface that routes to ADDRESS, e.g. the PBX")
 
-    clear_host = sub.add_parser("clear-host", help="remove host-mode shaping")
+    vm = sub.add_parser(
+        "apply-vm",
+        help="shape a libvirt VM's network device (tap: network/bridge); needs root",
+        description="Shape all of a libvirt VM's traffic on its host-side tap device "
+        "(vnetN). Delay and loss apply to traffic to and from the VM, including other "
+        "VMs on the same bridge. The shaping is lost when the VM restarts; apply again.",
+    )
+    vm.add_argument("domain", help="libvirt domain name")
+    _add_profile_args(vm)
+    vm.add_argument("--connect", "-c", default="qemu:///system", metavar="URI",
+                    help="libvirt URI (default qemu:///system)")
+    vm.add_argument("--mac", help="which interface, when the VM has several")
+
+    clear_host = sub.add_parser("clear-host", aliases=["clear-vm"],
+                                help="remove host-mode or VM shaping")
     target_group = clear_host.add_mutually_exclusive_group(required=True)
     target_group.add_argument("name", nargs="?")
     target_group.add_argument("--all", action="store_true", help="clear every host-mode target")
@@ -111,7 +126,8 @@ def _add_profile_args(parser: argparse.ArgumentParser) -> None:
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        handler = {"apply-host": _apply_host, "clear-host": _clear_host}.get(
+        handler = {"apply-host": _apply_host, "clear-host": _clear_host,
+                   "clear-vm": _clear_host, "apply-vm": _apply_vm}.get(
             args.command) or getattr(_Commands, args.command)
         return handler(args)
     except ProfileError as exc:
@@ -238,8 +254,11 @@ class _Commands:
             if not args.container or slot.name == args.container
         ]
         for slot in host_slots:
-            print(f"{slot.name}: host mode, profile={slot.profile} iface={slot.iface} "
-                  f"ports={format_ports(slot.ports)} direction={slot.direction}")
+            gone = not host_live.iface(slot.iface).exists
+            what = (f"vm mode, device={slot.iface}" if slot.kind == "vm"
+                    else f"host mode, iface={slot.iface} ports={format_ports(slot.ports)}")
+            print(f"{slot.name}: {what} profile={slot.profile} direction={slot.direction}"
+                  + (f" STALE ({slot.iface} is gone; re-apply or clear-host)" if gone else ""))
             for dev in (slot.up, slot.down):
                 print(host_backend.run(["tc", "-s", "qdisc", "show", "dev", dev]).strip())
         if not targets and not host_slots:
@@ -305,6 +324,30 @@ def _apply_host(args: argparse.Namespace) -> int:
         return EXIT_ERROR
     print(f"{args.name}: applied {profile.name} to {args.direction} on {iface} "
           f"ports {format_ports(ports)}")
+    return 0
+
+
+def _apply_vm(args: argparse.Namespace) -> int:
+    profile = _profile_from_args(args)
+    iface = resolve_vm(args.domain, args.connect, args.mac)
+    backend = HostBackend()
+    live = inspect_host(backend, [iface.device])
+    plan = build_host_apply(args.domain, profile, [], iface.device, args.direction, live,
+                            kind="vm")
+    print(f"# VM: {args.domain}, {iface.type} {iface.source}, MAC {iface.mac}")
+    print(f"# host device {iface.device}, slot {plan.slot.slot}, {args.direction} "
+          "(egress = from the VM)")
+    for command in plan.commands:
+        print("+ " + shlex.join(command))
+    if args.dry_run:
+        return 0
+    require_root()
+    try:
+        run_plan(backend, plan.commands, plan.rollback)
+    except CommandError as exc:
+        print(f"wanshape: apply-vm failed and was rolled back: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    print(f"{args.domain}: applied {profile.name} to {args.direction} on {iface.device}")
     return 0
 
 

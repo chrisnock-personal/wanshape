@@ -126,3 +126,31 @@ Open: CallRaven's loss figures are lower than what netem dropped (rx 0.2% vs ~1.
 its `remoteLossPercent` stayed 0 although uplink packets were dropped. Its `rxPackets` is also about
 3.5x `txPackets` on a G.722 call. These look like questions about how CallRaven counts, worth checking
 in CallRaven against a pcap, not wanshape behaviour.
+
+# VM mode spike — laptop, 2026-11-25
+
+Can wanshape shape a libvirt VM the way it shapes a host-network container? There is no passwordless
+sudo on the laptop, so the spike recreated libvirt's NAT/bridge layout in a private user + network
+namespace: a bridge `br0` with a tap `vnet0` (MAC `fe:` + guest MAC, as libvirt sets it) and a CirrOS
+0.6.2 guest under KVM (`qemu-system-x86_64 -netdev tap`). The guest was reached on its IPv6 link-local
+address; dnsmasq would not hand out leases inside the user namespace.
+
+| tc on the tap `vnet0` | ping to the guest |
+|---|---|
+| none | 0.6 ms |
+| clsact **egress** matchall -> IFB netem 100 ms | 100.8 ms |
+| + **ingress** matchall -> IFB netem 30 ms | 130.9 ms |
+| ingress only | 30.8 ms |
+| cleared | 0.7 ms |
+
+100% loss on the egress IFB dropped the echo requests: **the tap's egress hook carries traffic to the
+guest and its ingress hook traffic from it**, the reverse of a container's interface. `apply-vm` maps
+them accordingly (`tests/integration/vm_mode.sh` checks it with 100% loss per direction).
+
+Also found: libvirt's `<bandwidth><outbound>` puts a plain `ingress` qdisc on the tap, and `tc qdisc add
+clsact` then fails with "Exclusivity flag on, cannot modify". wanshape detects it and refuses (exit 4).
+
+Not covered yet: a libvirt-managed VM under sudo (resolution was checked against the real
+`virsh domiflist` on the laptop, whose FreePBX VM is `direct` and correctly refused); `direct`
+(macvtap) interfaces, whose hook directions need measuring as root; VM-to-VM traffic across the bridge
+(expected to be shaped, since the bridge sends to the tap through the same egress hook, not measured).

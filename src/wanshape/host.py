@@ -1,4 +1,9 @@
-"""Host mode: shape the traffic of a host-network container by its local ports.
+"""Host mode: shape traffic on a host interface without touching its root qdisc.
+
+Two kinds of target share this engine:
+
+- ports: a host-network container (or any local ports), matched by port;
+- vm: a virtual machine's tap device (libvirt vnetN), matched entirely.
 
 A host-network container has no network namespace of its own, so its traffic is
 picked out on a host interface by the local port it uses. Nothing replaces the
@@ -7,6 +12,12 @@ packets to a pair of IFB devices that carry the netem qdiscs.
 
     egress  (upload):   src_port in ranges -> mirred -> wsh<N>up (netem up)
     ingress (download): dst_port in ranges -> mirred -> wsh<N>dn (netem down)
+
+For a VM the tap's hooks are the other way round, because the tap's egress is
+what the host sends *to* the guest (measured in docs/SPIKE-RESULTS.md):
+
+    tap ingress (from the VM, its upload):  matchall -> wsh<N>up (netem up)
+    tap egress  (to the VM, its download):  matchall -> wsh<N>dn (netem down)
 
 Each target takes a slot N (0-9). Its filters use the prefs
 49300 + 100*N .. +99 on both hooks, and the slot's metadata (target name,
@@ -175,6 +186,7 @@ class HostSlot:
     ports: list[PortRange]
     direction: str
     added_clsact: bool
+    kind: str = "ports"  # "ports" or "vm"
 
     @property
     def up(self) -> str:
@@ -185,11 +197,32 @@ class HostSlot:
         return f"wsh{self.slot}dn"
 
     def alias(self) -> str:
+        ports = format_ports(self.ports) if self.ports else "all"
         return (
-            f"{ALIAS_PREFIX} name={self.name} profile={self.profile} iface={self.iface} "
-            f"ports={format_ports(self.ports)} dir={self.direction} "
+            f"{ALIAS_PREFIX} name={self.name} kind={self.kind} profile={self.profile} "
+            f"iface={self.iface} ports={ports} dir={self.direction} "
             f"clsact={int(self.added_clsact)}"
         )
+
+    def filters(self) -> list[tuple[str, list[str], str]]:
+        """(hook, match arguments, IFB) for each filter this target needs."""
+        result: list[tuple[str, list[str], str]] = []
+        if self.kind == "vm":
+            # Tap device: ingress = from the guest (up), egress = to the guest (down).
+            for want, hook, ifb in (("egress", "ingress", self.up),
+                                    ("ingress", "egress", self.down)):
+                if self.direction in (want, "both"):
+                    result.append((hook, ["protocol", "all", "matchall"], ifb))
+            return result
+        for hook, key, ifb in (("egress", "src_port", self.up),
+                               ("ingress", "dst_port", self.down)):
+            if self.direction not in (hook, "both"):
+                continue
+            for r in self.ports:
+                for proto, ip_proto in _PROTOCOLS:
+                    result.append((hook, ["protocol", proto, "flower", "ip_proto", ip_proto,
+                                          key, str(r)], ifb))
+        return result
 
 
 def slot_prefs(slot: int) -> range:
@@ -204,14 +237,16 @@ def parse_alias(slot: int, alias: str) -> HostSlot | None:
         part.split("=", 1) for part in alias[len(ALIAS_PREFIX) + 1 :].split() if "=" in part
     )
     try:
+        kind = fields.get("kind", "ports")
         return HostSlot(
             slot=slot,
             name=fields["name"],
             profile=fields.get("profile", "unknown"),
             iface=fields["iface"],
-            ports=parse_ports(fields["ports"]),
+            ports=[] if kind == "vm" else parse_ports(fields["ports"]),
             direction=fields.get("dir", "both"),
             added_clsact=fields.get("clsact") == "1",
+            kind=kind,
         )
     except (KeyError, WanshapeError):
         return None
@@ -219,7 +254,9 @@ def parse_alias(slot: int, alias: str) -> HostSlot | None:
 
 @dataclass
 class IfaceState:
+    exists: bool = True
     clsact: bool = False
+    ingress_qdisc: bool = False  # plain `ingress` qdisc: excludes clsact
     egress_prefs: set[int] = field(default_factory=set)
     ingress_prefs: set[int] = field(default_factory=set)
 
@@ -266,8 +303,11 @@ def inspect_host(backend, ifaces: Sequence[str] = ()) -> HostLive:
     for iface in sorted(wanted):
         state = live.iface(iface)
         if backend.run_result(["ip", "link", "show", "dev", iface]).returncode != 0:
+            state.exists = False  # e.g. a VM restarted and its tap was renamed
             continue
-        state.clsact = "clsact" in backend.run(["tc", "qdisc", "show", "dev", iface])
+        qdiscs = backend.run(["tc", "qdisc", "show", "dev", iface])
+        state.clsact = "qdisc clsact" in qdiscs
+        state.ingress_qdisc = "qdisc ingress" in qdiscs
         if state.clsact:
             for hook in ("egress", "ingress"):
                 text = backend.run(["tc", "filter", "show", "dev", iface, hook])
@@ -316,18 +356,33 @@ def build_host_apply(
     iface: str,
     direction: str,
     live: HostLive,
+    kind: str = "ports",
 ) -> HostPlan:
+    """Plan a ports target, or with kind="vm" (and no ports) a whole tap device."""
     if direction not in ("egress", "ingress", "both"):
         raise WanshapeError(f"invalid direction {direction!r}")
     if not _NAME.match(name):
         raise WanshapeError(f"invalid target name {name!r}")
+    if kind == "vm" and ports:
+        raise WanshapeError("a VM target shapes the whole device; it takes no ports")
+    if kind == "ports" and not ports:
+        raise WanshapeError("no ports given")
     if len(ports) > MAX_RANGES:
         raise WanshapeError(f"too many port ranges ({len(ports)}; at most {MAX_RANGES})")
 
     existing = live.by_name(name)
+    if existing and existing.kind != kind:
+        raise ConflictError(
+            f"{name!r} is already a {existing.kind} target; clear it first"
+        )
     for other in live.slots.values():
         if other is existing or other.iface != iface:
             continue
+        if kind == "vm" or other.kind == "vm":
+            raise ConflictError(
+                f"{iface} is already shaped for {other.name!r}; "
+                f"clear it first with `wanshape clear-host {other.name}`"
+            )
         clash = [f"{a}/{b}" for a in ports for b in other.ports if a.overlaps(b)]
         if clash:
             raise ConflictError(
@@ -337,6 +392,12 @@ def build_host_apply(
 
     commands: list[Command] = []
     state = live.iface(iface)
+    if state.ingress_qdisc and not state.clsact:
+        raise ConflictError(
+            f"{iface} has an `ingress` qdisc, which can't coexist with the clsact qdisc "
+            "wanshape needs (libvirt adds one for <bandwidth><outbound>); remove that "
+            "limit or the qdisc first"
+        )
     clsact_present = state.clsact
     if existing:
         # Re-apply: take down the old shaping, keep its slot, and keep clsact
@@ -358,7 +419,7 @@ def build_host_apply(
         added_clsact = True
     slot = HostSlot(
         slot=slot_no, name=name, profile=profile.name, iface=iface,
-        ports=list(ports), direction=direction, added_clsact=added_clsact,
+        ports=list(ports), direction=direction, added_clsact=added_clsact, kind=kind,
     )
     alias = slot.alias()
     if len(alias.encode()) > 255:
@@ -378,21 +439,17 @@ def build_host_apply(
     fresh.append(["ip", "link", "set", "dev", slot.up, "alias", alias])
     if not clsact_present:
         fresh.append(["tc", "qdisc", "add", "dev", iface, "clsact"])
-    for hook, key, ifb in (("egress", "src_port", slot.up), ("ingress", "dst_port", slot.down)):
-        if direction not in (hook, "both"):
-            continue
-        prefs = iter(slot_prefs(slot.slot))
-        for r in ports:
-            for proto, ip_proto in _PROTOCOLS:
-                fresh.append([
-                    "tc", "filter", "add", "dev", iface, hook, "pref", str(next(prefs)),
-                    "protocol", proto, "flower", "ip_proto", ip_proto, key, str(r),
-                    "action", "mirred", "egress", "redirect", "dev", ifb,
-                ])
+    prefs = {"egress": iter(slot_prefs(slot.slot)), "ingress": iter(slot_prefs(slot.slot))}
+    used: dict[str, list[int]] = {"egress": [], "ingress": []}
+    for hook, match, ifb in slot.filters():
+        pref = next(prefs[hook])
+        used[hook].append(pref)
+        fresh.append(["tc", "filter", "add", "dev", iface, hook, "pref", str(pref),
+                      *match, "action", "mirred", "egress", "redirect", "dev", ifb])
 
     rollback: list[Command] = []
     for hook in ("egress", "ingress"):
-        for pref in slot_prefs(slot.slot)[: len(ports) * len(_PROTOCOLS)]:
+        for pref in used[hook]:
             rollback.append(["tc", "filter", "del", "dev", iface, hook, "pref", str(pref)])
     rollback += [["ip", "link", "del", slot.up], ["ip", "link", "del", slot.down]]
     if not clsact_present:
@@ -418,6 +475,9 @@ def build_host_clear(slot: HostSlot, live: HostLive, keep_clsact: bool = False) 
     state = live.iface(slot.iface)
     commands: list[Command] = []
     ours = set(slot_prefs(slot.slot))
+    if not state.exists:
+        # The device is gone (and its filters with it): only our IFBs remain.
+        return [["ip", "link", "del", dev] for dev in (slot.up, slot.down) if dev in live.ifbs]
     for hook in ("egress", "ingress"):
         for pref in sorted(state.prefs(hook) & ours):
             commands.append(["tc", "filter", "del", "dev", slot.iface, hook, "pref", str(pref)])
