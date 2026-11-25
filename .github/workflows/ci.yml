@@ -42,8 +42,10 @@ jobs:
       - name: Kernel modules and user namespaces
         run: |
           sudo apt-get update -q
-          sudo apt-get install -yq "linux-modules-extra-$(uname -r)" iperf3
-          sudo modprobe -a sch_netem ifb act_mirred cls_flower cls_matchall
+          sudo apt-get install -yq iperf3
+          # netem and friends live in linux-modules-extra on some runner kernels.
+          sudo apt-get install -yq "linux-modules-extra-$(uname -r)" || echo "no modules-extra for $(uname -r)"
+          for m in sch_netem ifb act_mirred cls_flower cls_matchall; do sudo modprobe "$m" || echo "modprobe $m failed"; done
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - run: python3 bin/wanshape doctor
       - run: sh tests/integration/host_mode.sh
@@ -55,13 +57,15 @@ jobs:
       - name: Kernel modules, user namespaces, rootless Podman with pasta
         run: |
           sudo apt-get update -q
-          sudo apt-get install -yq "linux-modules-extra-$(uname -r)" podman passt
-          sudo modprobe -a sch_netem ifb act_mirred cls_flower cls_matchall
+          sudo apt-get install -yq podman passt
+          sudo apt-get install -yq "linux-modules-extra-$(uname -r)" || echo "no modules-extra for $(uname -r)"
+          for m in sch_netem ifb act_mirred cls_flower cls_matchall; do sudo modprobe "$m" || echo "modprobe $m failed"; done
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           # --duration needs the user's systemd.
           sudo loginctl enable-linger "$USER"
           echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
           echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" >> "$GITHUB_ENV"
+      - run: python3 bin/wanshape doctor
       - run: podman pull -q docker.io/library/python:3.12-slim
       - run: sh tests/integration/netns_mode.sh
 
@@ -76,8 +80,9 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
           sudo apt-get update -q
-          sudo apt-get install -yq "linux-modules-extra-$(uname -r)" qemu-system-x86
-          sudo modprobe -a sch_netem ifb act_mirred cls_flower cls_matchall
+          sudo apt-get install -yq qemu-system-x86
+          sudo apt-get install -yq "linux-modules-extra-$(uname -r)" || echo "no modules-extra for $(uname -r)"
+          for m in sch_netem ifb act_mirred cls_flower cls_matchall; do sudo modprobe "$m" || echo "modprobe $m failed"; done
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: CirrOS guest image
         run: |
