@@ -23,7 +23,7 @@ def args(**overrides) -> argparse.Namespace:
         container="test", profile=None, delay="10ms", jitter=None, loss=None,
         loss_model=None, rate=None, runtime=None, iface=None, direction="both",
         no_reorder=False, backend="nsenter", dry_run=False, force=False,
-        duration=None,
+        duration=None, allow_partial=False, distribution=None,
     )
     values.update(overrides)
     return argparse.Namespace(**values)
@@ -164,6 +164,120 @@ class MissingRuntimeTests(unittest.TestCase):
                 target.resolve("nothing-here")
             with self.assertRaises(WanshapeError):
                 host.inspect_container("nothing-here")
+
+
+class FailingBackend(FakeBackend):
+    """Fails the IFB creation, as on a kernel without the ifb module."""
+
+    def run(self, args):
+        if args[:3] == ["ip", "link", "add"]:
+            self.commands.append(list(args))
+            raise cli.CommandError(self.command(args), 2, "Error: Unknown device type.")
+        return super().run(args)
+
+
+class CliRollbackTests(unittest.TestCase):
+    """#9: a failed container apply is undone unless --allow-partial."""
+
+    def setUp(self):
+        self.backend = FailingBackend()
+        self.state = {}
+        clean = LiveState(root_kind="noqueue", root_handle="0:", clsact=False,
+                          our_filter=False, ifb=False)
+        egress_on = LiveState(root_kind="netem", root_handle="5753:", clsact=True,
+                              our_filter=False, ifb=False)
+        patches = [
+            mock.patch.object(cli, "resolve", return_value=target()),
+            mock.patch.object(cli, "get_backend", return_value=self.backend),
+            mock.patch.object(cli, "inspect_live", side_effect=[clean, egress_on]),
+            mock.patch.object(cli, "load_state", side_effect=lambda: dict(self.state)),
+            mock.patch.object(cli, "save_state", side_effect=self._save),
+            mock.patch.object(Target, "verify", return_value=None),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def _save(self, entries):
+        self.state = entries
+
+    def run_apply(self, **kw):
+        with mock.patch("sys.stdout", new_callable=io.StringIO), \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            code = cli._Commands.apply(args(**kw))
+        return code, err.getvalue()
+
+    def test_failed_ingress_rolls_back_egress(self):
+        code, err = self.run_apply()
+        self.assertEqual(code, 1)
+        self.assertIn("rolled back", err)
+        self.assertIn(["tc", "qdisc", "del", "dev", "eth0", "root"], self.backend.commands)
+        self.assertIn(["tc", "qdisc", "del", "dev", "eth0", "clsact"], self.backend.commands)
+        self.assertEqual(self.state, {})
+
+    def test_allow_partial_keeps_egress(self):
+        code, err = self.run_apply(allow_partial=True)
+        self.assertEqual(code, 1)
+        self.assertIn("egress remains active", err)
+        self.assertNotIn(["tc", "qdisc", "del", "dev", "eth0", "root"], self.backend.commands)
+        self.assertEqual(self.state["abc"]["direction"], "egress")
+
+
+class CliStatusTests(unittest.TestCase):
+    """#8: status --all finds shaping without a state entry; --prune drops stale entries."""
+
+    def status_args(self, **kw):
+        values = dict(container=None, all=False, prune=False)
+        values.update(kw)
+        return argparse.Namespace(**values)
+
+    def test_prune_drops_gone_and_recreated(self):
+        state = {
+            "gone": {"id": "gone", "name": "old", "netns_inode": 1},
+            "abc": {"id": "abc", "name": "test", "netns_inode": 7},    # recreated: now 42
+            "keep": {"id": "keep", "name": "keep", "netns_inode": 42},
+        }
+        saved = {}
+
+        def fake_resolve(key, runtime=None):
+            if key == "gone":
+                raise cli.WanshapeError("not found")
+            return target()
+
+        with mock.patch.object(cli, "resolve", side_effect=fake_resolve), \
+                mock.patch.object(cli, "save_state", side_effect=saved.update), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            cli._prune(state)
+        self.assertEqual(set(saved), {"keep"})
+        self.assertIn("pruned old: container is gone", out.getvalue())
+        self.assertIn("pruned test: container was recreated", out.getvalue())
+
+    def test_all_reports_unrecorded_shaping(self):
+        shaped = LiveState(root_kind="netem", root_handle="5753:", clsact=True,
+                           our_filter=True, ifb=True)
+        from wanshape.host import HostLive
+        with mock.patch.object(cli, "load_state", return_value={}), \
+                mock.patch.object(cli, "_scan_running", return_value=[target()]), \
+                mock.patch.object(cli, "get_backend", return_value=FakeBackend()), \
+                mock.patch.object(cli, "inspect_live", return_value=shaped), \
+                mock.patch.object(cli, "stats", return_value=""), \
+                mock.patch.object(cli, "inspect_host", return_value=HostLive()), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.assertEqual(cli._Commands.status(self.status_args(all=True)), 0)
+        self.assertIn("test: profile=unknown egress=on ingress=on", out.getvalue())
+
+    def test_all_skips_unshaped_containers(self):
+        clean = LiveState(root_kind="noqueue", root_handle="0:", clsact=False,
+                          our_filter=False, ifb=False)
+        from wanshape.host import HostLive
+        with mock.patch.object(cli, "load_state", return_value={}), \
+                mock.patch.object(cli, "_scan_running", return_value=[target()]), \
+                mock.patch.object(cli, "get_backend", return_value=FakeBackend()), \
+                mock.patch.object(cli, "inspect_live", return_value=clean), \
+                mock.patch.object(cli, "inspect_host", return_value=HostLive()), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            cli._Commands.status(self.status_args(all=True))
+        self.assertNotIn("test:", out.getvalue())
 
 
 if __name__ == "__main__":

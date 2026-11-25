@@ -39,7 +39,8 @@ EXIT_CONFLICT = 4
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="wanshape",
-        description="Apply netem/tc WAN impairments to individual containers",
+        description="Apply netem/tc WAN impairments to one container, one service's "
+        "ports (host mode) or one libvirt VM",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -55,6 +56,8 @@ def _parser() -> argparse.ArgumentParser:
     apply_cmd.add_argument("--iface", help="override the resolved interface")
     apply_cmd.add_argument("--backend", choices=("auto", "nsenter", "sidecar"), default="auto")
     apply_cmd.add_argument("--force", action="store_true", help="replace foreign qdisc/filters")
+    apply_cmd.add_argument("--allow-partial", action="store_true",
+                           help="if one direction fails, keep the other instead of rolling back")
     apply_cmd.add_argument("--duration", help="not implemented in this prototype")
 
     host = sub.add_parser(
@@ -96,6 +99,11 @@ def _parser() -> argparse.ArgumentParser:
 
     status = sub.add_parser("status", help="show live shaping state")
     status.add_argument("container", nargs="?")
+    status.add_argument("--all", action="store_true",
+                        help="also scan every running container for wanshape shaping, "
+                        "including any the state file doesn't know about")
+    status.add_argument("--prune", action="store_true",
+                        help="drop state entries for containers that are gone or recreated")
 
     clear = sub.add_parser("clear", help="remove wanshape's qdiscs")
     clear.add_argument("container")
@@ -144,12 +152,16 @@ def main(argv: list[str] | None = None) -> int:
 class _Commands:
     @staticmethod
     def doctor(_args: argparse.Namespace) -> int:
-        missing = [tool for tool in ("tc", "nsenter", "ip", "podman") if not shutil.which(tool)]
+        missing = [tool for tool in ("tc", "ip", "nsenter") if not shutil.which(tool)]
         if missing:
             print(f"MISSING tools: {', '.join(missing)}")
             return EXIT_PREREQ
-        print("tools: tc, nsenter, ip, podman found"
-              + (" (docker also found)" if shutil.which("docker") else ""))
+        print("tools: tc, ip, nsenter found")
+        runtimes = [r for r in ("podman", "docker") if shutil.which(r)]
+        print("containers: " + (", ".join(runtimes) if runtimes else
+                                "no podman or docker (container modes unavailable)"))
+        print("VMs: " + ("virsh found" if shutil.which("virsh") else
+                         "no virsh (apply-vm unavailable)"))
         modules = ("sch_netem", "ifb", "act_mirred", "cls_matchall", "cls_flower")
         for module in modules:
             if Path(f"/sys/module/{module}").exists():
@@ -159,7 +171,7 @@ class _Commands:
                 status = "available (autoload on use)" if result.returncode == 0 else "NOT FOUND"
             print(f"{module}: {status}")
         print("root: " + ("yes" if os.geteuid() == 0 else
-                          "no (fine for rootless containers; apply-host needs sudo)"))
+                          "no (fine for rootless containers; apply-host and apply-vm need sudo)"))
         return 0
 
     @staticmethod
@@ -212,17 +224,22 @@ class _Commands:
         if failure:
             failed_group, error = failure
             print(f"wanshape: {failed_group} shaping failed: {error}", file=sys.stderr)
-            if applied:
+            if applied and args.allow_partial:
                 _save_and_report(target, profile.name, "+".join(applied), live, plan,
                                  partial=True)
                 print(f"wanshape: {'+'.join(applied)} remains active; run `wanshape clear {target.name}`",
                       file=sys.stderr)
+            else:
+                _rollback(target, backend, plan)
             return EXIT_ERROR
         return _save_and_report(target, profile.name, args.direction, live, plan)
 
     @staticmethod
     def status(args: argparse.Namespace) -> int:
         entries = load_state()
+        if args.prune:
+            _prune(entries)
+            entries = load_state()
         targets: list[tuple[Target, dict | None]] = []
         if args.container:
             try:
@@ -244,9 +261,16 @@ class _Commands:
                     except WanshapeError:
                         pass
                 if target is None:
-                    print(f"wanshape: {entry.get('name')}: container is gone", file=sys.stderr)
+                    print(f"wanshape: {entry.get('name')}: container is gone "
+                          "(`wanshape status --prune` forgets it)", file=sys.stderr)
                     continue
                 targets.append((target, entry))
+            if args.all:
+                known = {t.netns_inode for t, _ in targets}
+                for target in _scan_running():
+                    if target.netns_inode not in known:
+                        known.add(target.netns_inode)
+                        targets.append((target, None))
         host_backend = HostBackend()
         host_live = inspect_host(host_backend)
         host_slots = [
@@ -261,11 +285,14 @@ class _Commands:
                   + (f" STALE ({slot.iface} is gone; re-apply or clear-host)" if gone else ""))
             for dev in (slot.up, slot.down):
                 print(host_backend.run(["tc", "-s", "qdisc", "show", "dev", dev]).strip())
-        if not targets and not host_slots:
-            print("no wanshape state found")
+        shown = len(host_slots)
         for target, entry in targets:
             backend = get_backend(target)
             live = inspect_live(backend, target.iface)
+            if entry is None and args.all and not args.container and not (
+                    live.egress or live.ingress):
+                continue  # scanned and not shaped: not worth a line
+            shown += 1
             profile = entry.get("profile", "unknown") if entry else "unknown"
             stale = bool(entry and entry.get("netns_inode") != target.netns_inode)
             print(f"{target.name}: profile={profile}"
@@ -274,6 +301,8 @@ class _Commands:
                   + (" STALE (container recreated)" if stale else ""))
             if live.egress or live.ingress:
                 print(stats(backend, target.iface))
+        if not shown:
+            print("no wanshape shaping found" if args.all else "no wanshape state found")
         return 0
 
     @staticmethod
@@ -416,6 +445,66 @@ def _print_plan(plan, backend, target: Target) -> None:
     print(f"# netns {target.netns_inode}, iface {target.iface}")
     for command in plan.commands:
         print("+ " + shlex.join(backend.command(command)))
+
+
+def _rollback(target: Target, backend, plan) -> None:
+    """Undo a failed container apply: remove everything wanshape set on the target.
+
+    For a re-apply this also removes the shaping that was there before; the
+    message says so. The state entry keeps what the first apply recorded about
+    the interface, so the clear restores the original root qdisc and clsact.
+    """
+    entries = load_state()
+    previous = entries.get(target.id) or {}
+    same_netns = previous.get("netns_inode") == target.netns_inode
+    prior = previous.get("prior_root_qdisc") if same_netns else plan.prior_root_qdisc
+    added_clsact = plan.added_clsact or (same_netns and bool(previous.get("added_clsact")))
+    try:
+        live = inspect_live(backend, target.iface)
+        undo = build_clear_plan(target.iface, "both", live, added_clsact, prior)
+    except WanshapeError as exc:
+        print(f"wanshape: could not roll back: {exc}", file=sys.stderr)
+        return
+    for command in undo.commands:
+        backend.run_result(command)
+    entries.pop(target.id, None)
+    save_state(entries)
+    print(f"wanshape: rolled back; {target.name} is not shaped "
+          "(use --allow-partial to keep the direction that worked)", file=sys.stderr)
+
+
+def _prune(entries: dict) -> None:
+    kept = {}
+    for key, entry in entries.items():
+        try:
+            target = resolve(entry.get("id") or key, entry.get("runtime"))
+        except WanshapeError:
+            print(f"pruned {entry.get('name', key)}: container is gone")
+            continue
+        if entry.get("netns_inode") != target.netns_inode:
+            print(f"pruned {entry.get('name', key)}: container was recreated")
+            continue
+        kept[key] = entry
+    save_state(kept)
+
+
+def _scan_running() -> list[Target]:
+    """Every running container this user can shape (host-network ones are skipped)."""
+    found: list[Target] = []
+    for runtime in ("podman", "docker"):
+        try:
+            result = subprocess.run([runtime, "ps", "-q", "--no-trunc"],
+                                    text=True, capture_output=True)
+        except FileNotFoundError:
+            continue
+        for cid in result.stdout.split():
+            try:
+                target = resolve(cid, runtime)
+                get_backend(target)
+            except WanshapeError:
+                continue  # host networking, rootful without root, gone meanwhile
+            found.append(target)
+    return found
 
 
 def _save_and_report(target, profile_name, direction, live, plan, partial=False) -> int:

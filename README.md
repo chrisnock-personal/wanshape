@@ -81,10 +81,16 @@ wanshape apply my-container --profile 3g --dry-run
 wanshape apply my-container --profile 3g                  # both directions
 wanshape apply my-container --delay 100ms --direction ingress
 wanshape status [my-container]                            # read from the kernel, with counters
+wanshape status --all                                     # also scan every running container
+wanshape status --prune                                   # forget containers that are gone
 wanshape clear my-container
 ```
 
 Applying again replaces the settings. `--force` replaces another tool's root qdisc or ingress filter; without it, wanshape refuses to change them.
+
+If one direction fails (for example the kernel has no `ifb` module, so incoming traffic can't be shaped), wanshape undoes everything it set and the container is left unshaped. `--allow-partial` keeps the direction that worked instead.
+
+`status` lists the containers in wanshape's state file (`~/.local/state/wanshape/state.json`). `status --all` also checks every running container you can shape, so it finds shaping applied by another user, by root, or before the state file was lost. `status --prune` forgets entries whose container was removed or recreated.
 
 With pasta (rootless Podman's default network), connections from the host to a published port on `127.0.0.1` skip the container's interface and are **not shaped**. Reach the container on a non-loopback address.
 

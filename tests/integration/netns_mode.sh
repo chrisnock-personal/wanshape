@@ -76,6 +76,21 @@ expect "cleared" ws-it-b "$A_IP" 9999 0 10
 ws status ws-it-a | grep -q "egress=off ingress=off" || fail "shaping left after clear"
 echo "ok   nothing left after clear"
 
+echo "# status --all / --prune"
+ws apply ws-it-a --delay 30ms > /dev/null
+rm -f "$STATE/wanshape/state.json"            # state lost: plain status can't see it
+ws status | grep -q "ws-it-a" && fail "plain status found ws-it-a without state"
+ws status --all | grep -q "ws-it-a: profile=unknown egress=on ingress=on" \
+    || fail "status --all did not find the unrecorded shaping"
+echo "ok   status --all finds shaping the state file doesn't know about"
+ws clear ws-it-a > /dev/null
+expect "cleared without state" ws-it-b "$A_IP" 9999 0 10
+ws apply ws-it-b --delay 5ms --direction egress > /dev/null
+podman rm -f -t 0 ws-it-b > /dev/null
+ws status --prune 2>&1 | grep -q "pruned ws-it-b: container is gone" || fail "prune"
+ws status 2>&1 | grep -q "ws-it-b" && fail "pruned entry still listed"
+echo "ok   status --prune forgets a removed container"
+
 echo "# pasta (rootless default)"
 python3 -c "$ECHO_PY" 39999 &
 ECHO=$!
