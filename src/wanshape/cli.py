@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import shlex
 import shutil
@@ -111,6 +112,8 @@ def _parser() -> argparse.ArgumentParser:
                                 help="remove host-mode or VM shaping")
     clear_host.add_argument("name", nargs="*", help="target name(s)")
     clear_host.add_argument("--all", action="store_true", help="clear every host-mode target")
+    clear_host.add_argument("--connect", "-c", default="qemu:///system", metavar="URI",
+                            help="libvirt URI, to accept a VM's UUID or ID (clear-vm)")
     clear_host.add_argument("--dry-run", action="store_true")
 
     status = sub.add_parser("status", help="show live shaping state")
@@ -171,15 +174,11 @@ def _add_profile_args(parser: argparse.ArgumentParser) -> None:
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        locked = {"apply-host", "apply-vm", "clear-host", "clear-vm", "vm-hook"}
         handler = {"apply-host": _apply_host, "clear-host": _clear_host,
                    "clear-vm": _clear_host, "apply-vm": _apply_vm, "vm-hook": _vm_hook,
                    "install-vm-hook": _install_vm_hook,
                    "uninstall-vm-hook": _uninstall_vm_hook}.get(
             args.command) or getattr(_Commands, args.command)
-        if args.command in locked and not getattr(args, "dry_run", False):
-            with host_lock():
-                return handler(args)
         return handler(args)
     except ProfileError as exc:
         print(f"wanshape: invalid profile: {exc}", file=sys.stderr)
@@ -399,6 +398,7 @@ def _clear_container(target: Target, args: argparse.Namespace) -> None:
               f"{'egress' if left.egress else 'ingress'} still shaped")
         return
     timer.cancel(_container_unit(target))
+    timer.cancel_legacy("container", target.name)
     for key in [k for k, e in entries.items()
                 if k == target.id or e.get("netns_inode") == target.netns_inode]:
         entries.pop(key)
@@ -436,6 +436,7 @@ def _apply_container(prep, args: argparse.Namespace, profile: Profile,
     # One timer per network namespace: shared by every member of a pod.
     unit = _container_unit(target)
     try:
+        timer.cancel_legacy("container", target.name)   # a pre-0.4 timer for this name
         if seconds:
             timer.schedule(unit, seconds, ["clear", target.id, "--runtime", target.runtime,
                                            "--iface", target.iface])
@@ -499,7 +500,8 @@ def _run_host_plans(backend, plans, args: argparse.Namespace, profile: Profile,
             _host_timer(plan.slot.kind, name, seconds)
         except WanshapeError as exc:
             _undo_host_target(backend, name)   # e.g. the timer couldn't be scheduled
-            _tidy_clsact(backend, plan.slot.iface)
+            if plan.slot.added_clsact:   # only a clsact wanshape added or co-owned
+                _tidy_clsact(backend, plan.slot.iface)
             print(f"wanshape: {name}: failed and was rolled back: {exc}", file=sys.stderr)
             failed.append(name)
             if not args.keep_going:
@@ -544,13 +546,21 @@ def _apply_host(args: argparse.Namespace) -> int:
             "label each container (wanshape.ports, wanshape.remote_ports)")
     backend = HostBackend()
     iface = resolve_host_iface(backend, args.iface, args.via or args.peer)
-    live = inspect_host(backend, [iface])
-    plans = []
-    for name in names:
+    looked_up = []
+    for name in names:   # container lookups first, outside the lock
         remote = (parse_ports(args.remote_ports) if args.remote_ports
                   else remote_ports_from_container(name, args.runtime))
         ports, source = host_ports_for(name, args.runtime, args.ports,
                                        optional=bool(remote or args.peer))
+        looked_up.append((name, remote, ports, source))
+    with host_lock() if not args.dry_run else contextlib.nullcontext():
+        return _plan_and_run_host(args, profile, seconds, backend, iface, looked_up)
+
+
+def _plan_and_run_host(args, profile, seconds, backend, iface, looked_up) -> int:
+    live = inspect_host(backend, [iface])
+    plans = []
+    for name, remote, ports, source in looked_up:
         plan = build_host_apply(name, profile, ports, iface, args.direction, live,
                                 remote_ports=remote, peer=args.peer,
                                 until=timer.until(seconds) if seconds else None)
@@ -574,6 +584,13 @@ def _apply_vm(args: argparse.Namespace) -> int:
     vms = [(canonical_name(name, args.connect), resolve_vm(name, args.connect, args.mac))
            for name in names]
     backend = HostBackend()
+    # virsh lookups are done above, outside the lock: the libvirt hook waits on
+    # this lock while libvirt holds the VM, and virsh would wait for libvirt.
+    with host_lock() if not args.dry_run else contextlib.nullcontext():
+        return _plan_and_run_vms(args, profile, seconds, backend, vms)
+
+
+def _plan_and_run_vms(args, profile, seconds, backend, vms) -> int:
     live = inspect_host(backend, [iface.device for _, iface in vms])
     plans = []
     for name, iface in vms:
@@ -622,7 +639,10 @@ def _vm_hook(args: argparse.Namespace) -> int:
                 for command in build_host_clear(slot, live):
                     backend.run_result(command)
 
-        done = vmhook.run_hook(domain, operation, sub_operation, xml_text, apply_fn, release_fn)
+        # Wait at most 30 s for a running wanshape command: never block a VM start.
+        with host_lock(timeout=30):
+            done = vmhook.run_hook(domain, operation, sub_operation, xml_text, apply_fn,
+                                   release_fn)
         if done != "not a wanshape VM":
             print(f"wanshape vm-hook: {domain} {operation} {sub_operation}: {done}",
                   file=sys.stderr)
@@ -658,6 +678,7 @@ def _duration(args: argparse.Namespace) -> int | None:
 
 def _host_timer(kind: str, name: str, seconds: int | None) -> None:
     unit = timer.unit_name(kind, name)
+    timer.cancel_legacy(kind, name)
     if seconds:
         timer.schedule(unit, seconds, ["clear-host", name])
         print(f"{name}: {timer.remaining(timer.until(seconds))}")
@@ -666,11 +687,21 @@ def _host_timer(kind: str, name: str, seconds: int | None) -> None:
 
 
 def _clear_host(args: argparse.Namespace) -> int:
-    backend = HostBackend()
-    live = inspect_host(backend)
     names = _names(args.name)
     if args.all == bool(names):
         raise WanshapeError("give target name(s) or --all")
+    if args.command == "clear-vm":
+        # VMs are recorded under their name: accept the UUID or ID apply-vm took.
+        # (virsh is asked here, before the lock; see _apply_vm.)
+        known = {s.name for s in inspect_host(HostBackend()).slots.values()} | set(vmhook.load())
+        names = [n if n in known else canonical_name(n, args.connect) for n in names]
+    with host_lock() if not args.dry_run else contextlib.nullcontext():
+        return _clear_host_locked(args, names)
+
+
+def _clear_host_locked(args: argparse.Namespace, names: list[str]) -> int:
+    backend = HostBackend()
+    live = inspect_host(backend)
     if args.all:
         slots = sorted(live.slots.values(), key=lambda x: x.slot)
     else:
@@ -702,6 +733,7 @@ def _clear_host(args: argparse.Namespace) -> int:
         require_root()
         run_plan(backend, commands)
         timer.cancel(timer.unit_name(slot.kind, slot.name))
+        timer.cancel_legacy(slot.kind, slot.name)
         label = "VM" if slot.kind == "vm" else "host-mode"
         print(f"{slot.name}: cleared {label} shaping on {slot.iface}")
         # Later slots must see this one gone (e.g. to decide on removing clsact).

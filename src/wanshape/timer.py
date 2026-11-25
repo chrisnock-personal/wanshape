@@ -8,6 +8,7 @@ again replaces it and clearing cancels it.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
@@ -21,6 +22,7 @@ from .errors import PrerequisiteError, WanshapeError
 _DURATION = re.compile(r"^(\d+(?:\.\d+)?)(s|m|h)?$")
 # '.' is replaced too: systemd would read "web.service" as a unit type suffix.
 _UNIT_SAFE = re.compile(r"[^A-Za-z0-9_-]")
+_LEGACY_UNSAFE = re.compile(r"[^A-Za-z0-9_.-]")   # the scheme before v0.4
 
 
 def parse_duration(text: str) -> int:
@@ -35,7 +37,20 @@ def parse_duration(text: str) -> int:
 
 
 def unit_name(kind: str, name: str) -> str:
-    return f"wanshape-clear-{kind}-{_UNIT_SAFE.sub('_', name)}"
+    """One systemd unit per target. The readable part can repeat ("web.1" and
+    "web_1" both give "web_1"), so a short hash of the exact name keeps them apart."""
+    digest = hashlib.sha1(f"{kind}:{name}".encode()).hexdigest()[:8]
+    return f"wanshape-clear-{kind}-{_UNIT_SAFE.sub('_', name)}-{digest}"
+
+
+def legacy_unit_names(kind: str, name: str) -> list[str]:
+    """Unit names earlier versions used for this target, to cancel after an upgrade."""
+    return [f"wanshape-clear-{kind}-{_LEGACY_UNSAFE.sub('_', name)}"]
+
+
+def cancel_legacy(kind: str, name: str) -> None:
+    for unit in legacy_unit_names(kind, name):
+        cancel(unit)
 
 
 def _user() -> bool:

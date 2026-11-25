@@ -106,8 +106,11 @@ class TimerUnitTests(unittest.TestCase):
         clear_args = schedule.call_args[0][2]
         self.assertEqual(clear_args[-2:], ["--iface", "eth1"])
 
-    def test_unit_names_have_no_dots(self):
-        self.assertEqual(timer.unit_name("vm", "web.service"), "wanshape-clear-vm-web_service")
+    def test_unit_names_have_no_dots_and_dont_collide(self):
+        self.assertNotIn(".", timer.unit_name("vm", "web.service"))
+        self.assertNotEqual(timer.unit_name("host", "web.1"), timer.unit_name("host", "web_1"))
+        self.assertEqual(timer.legacy_unit_names("container", "web.1"),
+                         ["wanshape-clear-container-web.1"])
 
     def test_timer_failure_rolls_the_container_back(self):
         """8"""
@@ -216,6 +219,91 @@ class CanonicalNameTests(unittest.TestCase):
         def missing(uri, *a):
             raise WanshapeError("no domain")
         self.assertEqual(canonical_name("nope", virsh=missing), "nope")
+
+
+class LockTests(unittest.TestCase):
+    """Review of #19: the lock is root-only and the hook never waits forever."""
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name) / "wanshape"
+        patcher = mock.patch.object(host, "LOCK_DIR", self.dir)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def as_root(self):
+        import os
+        real_lstat = os.lstat
+
+        def lstat(path):
+            st = real_lstat(path)
+            return mock.Mock(st_mode=st.st_mode, st_uid=0)
+        return mock.patch("os.geteuid", return_value=0), mock.patch("os.lstat", side_effect=lstat)
+
+    def test_no_root_no_lock(self):
+        with mock.patch("os.geteuid", return_value=1000):
+            with host.host_lock():
+                pass
+        self.assertFalse(self.dir.exists())
+
+    def test_writable_by_others_is_refused(self):
+        import os
+        self.dir.mkdir()
+        os.chmod(self.dir, 0o777)
+        euid, lstat = self.as_root()
+        with euid, lstat, self.assertRaises(WanshapeError):
+            with host.host_lock():
+                pass
+
+    def test_hook_gives_up_after_its_timeout(self):
+        import fcntl
+        import os
+        euid, lstat = self.as_root()
+        with euid, lstat:
+            with host.host_lock():            # holds the lock (creates the dir)
+                fd = os.open(self.dir / "lock", os.O_RDWR)
+                self.addCleanup(os.close, fd)
+            fcntl.flock(fd, fcntl.LOCK_EX)    # someone else holds it now
+            with self.assertRaisesRegex(WanshapeError, "held the lock"):
+                with host.host_lock(timeout=0.3):
+                    pass
+
+
+class ProfileNameSkipTests(unittest.TestCase):
+    def test_bad_user_profile_name_is_skipped_not_fatal(self):
+        import os
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as cfg:
+            (Path(cfg) / "wanshape").mkdir()
+            (Path(cfg) / "wanshape" / "profiles.toml").write_text(
+                '[profiles."voip+jitter".up]\ndelay = "5ms"\n[profiles.ok.up]\ndelay = "5ms"\n')
+            with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": cfg}), \
+                    mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+                profiles = load_profiles()
+        self.assertIn("ok", profiles)
+        self.assertIn("3g", profiles)
+        self.assertNotIn("voip+jitter", profiles)
+        self.assertIn("skipping profile", err.getvalue())
+
+
+class ClearVmByUuidTests(unittest.TestCase):
+    def test_uuid_is_turned_into_the_name(self):
+        slot = HostSlot(0, "web", "3g", "vnet0", [], "both", True, kind="vm")
+        live = HostLive(slots={0: slot}, ifbs={"wsh0up", "wsh0dn"},
+                        ifaces={"vnet0": IfaceState(clsact=True)})
+        a = argparse.Namespace(name=["3f2a-uuid"], all=False, dry_run=True,
+                               command="clear-vm", connect="qemu:///system")
+        with mock.patch.object(cli, "inspect_host", return_value=live), \
+                mock.patch.object(cli.vmhook, "load", return_value={}), \
+                mock.patch.object(cli, "canonical_name", return_value="web") as canon, \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            cli._clear_host(a)
+        canon.assert_called_once_with("3f2a-uuid", "qemu:///system")
+        self.assertIn("ip link del wsh0up", out.getvalue())
 
 
 if __name__ == "__main__":

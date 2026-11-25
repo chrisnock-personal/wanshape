@@ -19,7 +19,8 @@ class DurationTests(unittest.TestCase):
                 timer.parse_duration(bad)
 
     def test_unit_name_is_safe(self):
-        self.assertEqual(timer.unit_name("vm", "web 1/x"), "wanshape-clear-vm-web_1_x")
+        unit = timer.unit_name("vm", "web 1/x")
+        self.assertRegex(unit, r"^wanshape-clear-vm-web_1_x-[0-9a-f]{8}$")
 
     def test_remaining(self):
         self.assertIsNone(timer.remaining(None))

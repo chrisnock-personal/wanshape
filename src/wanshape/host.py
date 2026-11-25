@@ -35,7 +35,9 @@ import ipaddress
 import json
 import os
 import re
+import stat
 import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Sequence
@@ -610,25 +612,47 @@ def run_plan(backend, commands: Sequence[Command], rollback: Sequence[Command] =
         done.append(command)
 
 
+LOCK_DIR = Path(os.environ.get("WANSHAPE_LOCK_DIR", "/run/wanshape"))
+
+
 @contextlib.contextmanager
-def host_lock():
+def host_lock(timeout: float | None = None):
     """Serialise host and VM changes (two applies would otherwise pick one slot).
 
-    Best effort: without permission to create the lock file (a non-root dry run)
-    it proceeds unlocked, since nothing is changed then.
+    The lock lives in a directory only root can write (/run/wanshape, 0700),
+    opened without following symlinks, so another local user can neither hold
+    it nor switch it off. Without root nothing is locked: such a run is refused
+    by require_root() before it changes anything. With `timeout` (the libvirt
+    hook), waiting longer raises instead of blocking a VM start.
     """
-    path = Path(os.environ.get("WANSHAPE_LOCK", "/run/lock/wanshape.lock"))
-    try:
-        handle = open(path, "a")
-    except OSError:
+    if os.geteuid() != 0:
         yield
         return
-    with handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)
+    try:
+        LOCK_DIR.mkdir(mode=0o700, exist_ok=True)
+        info = os.lstat(LOCK_DIR)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            raise WanshapeError(f"{LOCK_DIR} must be a root-owned directory others can't write")
+        fd = os.open(LOCK_DIR / "lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError as exc:
+        raise PrerequisiteError(f"cannot take the wanshape lock in {LOCK_DIR}: {exc}") from exc
+    try:
+        if timeout is None:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        else:
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise WanshapeError(
+                            f"another wanshape run held the lock for {timeout:.0f} s") from None
+                    time.sleep(0.2)
+        yield
+    finally:
+        os.close(fd)   # releases the lock
 
 
 # --------------------------------------------------------------- containers

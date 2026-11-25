@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import shlex
+import sys
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -422,6 +423,11 @@ def load_profiles() -> dict[str, Profile]:
         with user_file.open("rb") as fh:
             user_data = tomllib.load(fh).get("profiles", {})
         for name, raw in user_data.items():
+            if not _PROFILE_NAME.match(str(name)):
+                # Skip it rather than break every command, built-ins included.
+                print(f"wanshape: skipping profile {name!r} in {user_file}: names use "
+                      "letters, digits, '.', '_' and '-'", file=sys.stderr)
+                continue
             data.setdefault("profiles", {})[name] = raw
     profiles = {
         name: _profile_from(name, raw) for name, raw in data.get("profiles", {}).items()
