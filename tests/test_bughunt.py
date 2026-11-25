@@ -120,6 +120,7 @@ class TimerUnitTests(unittest.TestCase):
         plan = cli.build_apply_plan(load_profiles()["3g"], "eth1", "egress", clean)
         with mock.patch.object(timer, "schedule") as schedule, \
                 mock.patch.object(cli, "_save_and_report"), \
+                mock.patch.object(cli, "netns_members", return_value=[]), \
                 mock.patch.object(Target, "verify", return_value=None):
             ok = cli._apply_container((a, backend, clean, plan), args(container=["a"]),
                                       load_profiles()["3g"], 300)
@@ -141,6 +142,7 @@ class TimerUnitTests(unittest.TestCase):
         clean = LiveState("noqueue", "0:", False, False, False)
         plan = cli.build_apply_plan(load_profiles()["3g"], "eth0", "egress", clean)
         with mock.patch.object(timer, "schedule", side_effect=WanshapeError("no systemd")), \
+                mock.patch.object(cli, "netns_members", return_value=[]), \
                 mock.patch.object(cli, "_rollback") as rollback, \
                 mock.patch.object(Target, "verify", return_value=None), \
                 mock.patch("sys.stderr", new_callable=io.StringIO):
@@ -487,6 +489,86 @@ class FourthReviewTests(unittest.TestCase):
         self.assertIn("lte.v3", profiles)
         self.assertNotIn("lte", profiles)
         self.assertIn("skipping profile 'lte'", err.getvalue())
+
+
+class FifthReviewTests(unittest.TestCase):
+    def test_pod_member_timer_has_no_pid_guard(self):
+        member = Target(name="web", id="idw", runtime="podman", rootless=True, pid=5,
+                        netns_inode=77, userns_inode=1, network_mode="bridge", iface="eth0",
+                        owner_uid=1000, pod="podid")
+        self.assertFalse(member.owns_netns)
+        clean = LiveState("noqueue", "0:", False, False, False)
+        plan = cli.build_apply_plan(load_profiles()["3g"], "eth0", "egress", clean)
+        with mock.patch.object(timer, "schedule") as schedule, \
+                mock.patch.object(timer, "cancel_legacy") as legacy, \
+                mock.patch.object(cli, "_save_and_report"), \
+                mock.patch.object(cli, "netns_members", return_value=["infra", "db"]), \
+                mock.patch.object(Target, "verify", return_value=None):
+            cli._apply_container((member, FakeBackend(), clean, plan), args(),
+                                 load_profiles()["3g"], 60)
+        self.assertNotIn("--only-pid", schedule.call_args[0][2])
+        self.assertEqual([c.args[1] for c in legacy.call_args_list], ["web", "infra", "db"])
+
+    def test_failed_undo_keeps_the_timer_and_says_still_shaped(self):
+        plans = []
+        live = HostLive()
+        for name, port in (("a", "6000"), ("b", "6001")):
+            plan = build_host_apply(name, load_profiles()["3g"], parse_ports(port), "eth0",
+                                    "both", live)
+            cli._simulate(live, plan)
+            plans.append((name, plan))
+
+        def run_plan(b, commands):
+            if any("wsh1up" in c for c in commands):
+                raise CommandError(["tc"], 2, "boom")
+        a = argparse.Namespace(keep_going=False, direction="both")
+        with mock.patch.object(cli, "run_plan", side_effect=run_plan), \
+                mock.patch.object(cli, "require_root"), \
+                mock.patch.object(cli, "_host_timer"), \
+                mock.patch.object(cli, "_undo_host_target", side_effect=WanshapeError("tc")), \
+                mock.patch.object(cli, "_tidy_clsact"), \
+                mock.patch.object(timer, "cancel") as cancel, \
+                mock.patch("sys.stdout", new_callable=io.StringIO), \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            cli._run_host_plans(FakeBackend(), plans, a, load_profiles()["3g"], 60)
+        cancel.assert_not_called()
+        self.assertIn("still shaped", err.getvalue())
+        self.assertNotIn("a: undone", err.getvalue())
+
+    def user_profiles(self, text):
+        import os
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as cfg:
+            (Path(cfg) / "wanshape").mkdir()
+            (Path(cfg) / "wanshape" / "profiles.toml").write_text(text)
+            with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": cfg}), \
+                    mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+                return load_profiles(), err.getvalue()
+
+    def test_invalid_override_falls_back_to_the_built_in(self):
+        profiles, err = self.user_profiles('[profiles.3g.up]\ndelay = "bogus"\n')
+        self.assertEqual(profiles["3g"].up.delay, "150ms")
+        self.assertIn("using the built-in", err)
+
+    def test_broken_toml_is_ignored_with_a_warning(self):
+        profiles, err = self.user_profiles('[profiles.x\n')
+        self.assertIn("3g", profiles)
+        self.assertIn("ignoring", err)
+
+    def test_trailing_newline_name_is_refused(self):
+        from wanshape.profiles import _profile_from
+        with self.assertRaises(ProfileError):
+            _profile_from("lte\n", {"up": {"delay": "5ms"}})
+
+    def test_pre_upgrade_vm_slot_without_mac_is_taken_over(self):
+        old = HostSlot(0, "vm-a", "3g", "vnet0", [], "both", True, kind="vm")   # no mac
+        live = HostLive(slots={0: old}, ifbs={"wsh0up", "wsh0dn"},
+                        ifaces={"vnet0": IfaceState(clsact=True)})
+        plan = build_host_apply("vm-b", load_profiles()["3g"], [], "vnet0", "both", live,
+                                kind="vm", mac="52:54:00:00:00:0b")
+        self.assertEqual(plan.slot.slot, 0)
+        self.assertTrue(plan.replaces)
 
 
 if __name__ == "__main__":

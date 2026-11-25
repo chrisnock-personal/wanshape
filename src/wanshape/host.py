@@ -59,7 +59,7 @@ ALIAS_PREFIX = "wanshape-host"
 PORTS_LABEL = "wanshape.ports"
 _PROTOCOLS = (("ip", "udp"), ("ip", "tcp"), ("ipv6", "udp"), ("ipv6", "tcp"))
 MAX_RANGES = PREFS_PER_SLOT // len(_PROTOCOLS)
-_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
+_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}")   # used with fullmatch
 _IFB = re.compile(r"^wsh(\d)(up|dn)$")
 _PREF = re.compile(r"\bpref\s+(\d+)\b")
 _DEV = re.compile(r"\bdev\s+(\S+)")
@@ -439,7 +439,7 @@ def build_host_apply(
             raise WanshapeError(f"invalid peer address {peer!r}") from exc
     if direction not in ("egress", "ingress", "both"):
         raise WanshapeError(f"invalid direction {direction!r}")
-    if not _NAME.match(name):
+    if not _NAME.fullmatch(name):
         raise WanshapeError(f"invalid target name {name!r}")
     if kind == "vm" and ports:
         raise WanshapeError("a VM target shapes the whole device; it takes no ports")
@@ -453,9 +453,11 @@ def build_host_apply(
         raise ConflictError(
             f"{name!r} is already a {existing.kind} target; clear it first"
         )
+    # Another VM's slot on this device is stale: resolve_vm checked that the
+    # device now carries this VM's MAC. Slots from before v0.4 record no MAC.
     stale_here = [o for o in live.slots.values()
                   if o is not existing and o.iface == iface and o.kind == "vm" and kind == "vm"
-                  and o.mac and mac and o.mac != mac.lower()]
+                  and mac and (not o.mac or o.mac != mac.lower())]
     for other in live.slots.values():
         if other is existing or other.iface != iface or other in stale_here:
             continue

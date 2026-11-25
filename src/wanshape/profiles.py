@@ -381,11 +381,11 @@ def _direction_from(label: str, raw: dict) -> Direction:
     return Direction(**{k: str(v) for k, v in raw.items()})
 
 
-_PROFILE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+_PROFILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")   # used with fullmatch
 
 
 def _profile_from(name: str, raw: dict) -> Profile:
-    if not _PROFILE_NAME.match(name):
+    if not _PROFILE_NAME.fullmatch(name):
         raise ProfileError(f"invalid profile name {name!r}: letters, digits, '.', '_', '-'")
     unknown = set(raw) - {"description", "reorder_on_jitter", "rate_mode", "up", "down"}
     if unknown:
@@ -420,11 +420,21 @@ def load_profiles() -> dict[str, Profile]:
     config = _config_home()
     user_file = config / "wanshape" / "profiles.toml"
     user_names: set[str] = set()
-    if user_file.is_file():
-        with user_file.open("rb") as fh:
-            user_data = tomllib.load(fh).get("profiles", {})
+    builtins = dict(data.get("profiles", {}))
+    user_data: dict = {}
+    try:
+        if user_file.is_file():
+            with user_file.open("rb") as fh:
+                user_data = tomllib.load(fh).get("profiles", {})
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        # Unreadable or not valid TOML: carry on with the built-ins.
+        print(f"wanshape: ignoring {user_file}: {exc}", file=sys.stderr)
+        user_data = {}
+    if not isinstance(user_data, dict):
+        user_data = {}
+    if user_data:
         for name, raw in user_data.items():
-            if not _PROFILE_NAME.match(str(name)):
+            if not _PROFILE_NAME.fullmatch(str(name)):
                 # Skip it rather than break every command, built-ins included.
                 print(f"wanshape: skipping profile {name!r} in {user_file}: names use "
                       "letters, digits, '.', '_' and '-'", file=sys.stderr)
@@ -439,9 +449,13 @@ def load_profiles() -> dict[str, Profile]:
         except ProfileError as exc:
             if name not in user_names:
                 raise   # a built-in must be valid
-            # A bad user profile is skipped, not fatal for every command.
-            print(f"wanshape: skipping profile {name!r} in {user_file}: {exc}",
+            # A bad user profile is skipped, not fatal for every command; if it
+            # overrode a built-in, the built-in stays.
+            fallback = " (using the built-in)" if name in builtins else ""
+            print(f"wanshape: skipping profile {name!r} in {user_file}: {exc}{fallback}",
                   file=sys.stderr)
+            if name in builtins:
+                profiles[name] = _profile_from(name, builtins[name])
             continue
         profiles[name] = profile
     return profiles

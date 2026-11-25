@@ -448,12 +448,16 @@ def _apply_container(prep, args: argparse.Namespace, profile: Profile,
     # One timer per network namespace: shared by every member of a pod.
     unit = _container_unit(target)
     try:
-        timer.cancel_legacy("container", target.name)   # a pre-0.4 timer for this name
+        for member in [target.name, *netns_members(target)]:   # pre-0.4 timers, any member
+            timer.cancel_legacy("container", member)
         if seconds:
+            guard = ["--only-netns", str(target.netns_inode)]
+            if target.owns_netns:
+                # A pod member can restart (new PID) while the pod keeps its
+                # namespace and the shaping; only an owner's PID tells restarts apart.
+                guard += ["--only-pid", str(target.pid)]
             timer.schedule(unit, seconds, ["clear", target.id, "--runtime", target.runtime,
-                                           "--iface", target.iface,
-                                           "--only-netns", str(target.netns_inode),
-                                           "--only-pid", str(target.pid)])
+                                           "--iface", target.iface, *guard])
         else:
             timer.cancel(unit)
     except WanshapeError as exc:
@@ -547,8 +551,10 @@ def _run_host_plans(backend, plans, args: argparse.Namespace, profile: Profile,
                     try:
                         _undo_host_target(backend, done_name)
                     except WanshapeError as cleanup:
-                        print(f"wanshape: {done_name}: could not undo: {cleanup}",
-                              file=sys.stderr)
+                        # Still shaped: keep its timer so it is cleared in the end.
+                        print(f"wanshape: {done_name}: could not undo, still shaped: "
+                              f"{cleanup}", file=sys.stderr)
+                        continue
                     timer.cancel(timer.unit_name(done_plan.slot.kind, done_name))
                     print(f"wanshape: {done_name}: undone (use --keep-going to keep "
                           "the targets that worked)", file=sys.stderr)
