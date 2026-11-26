@@ -122,7 +122,7 @@ The device comes from `virsh domiflist` and must carry the VM's MAC (`fe:` + the
 
 ## 9. Open work
 
-Tracked as GitHub issues: measuring the delay on a VM's new device after a real restart with the libvirt hook (#3; the re-apply itself was confirmed on libvirt in WSL2), PyPI publishing (#14). Decided against: the sidecar backend (#4), since root already covers rootful runtimes. Macvtap VMs (#1), VM-to-VM traffic (#2), `--duration` as root (#5) and Docker (#4, in CI) are done and measured.
+Tracked as GitHub issues: measuring the delay on a VM's new device after a real restart with the libvirt hook (#3; the re-apply itself was confirmed on libvirt in WSL2; [verification checklist](VM-HOOK-VERIFICATION.md)), PyPI publishing (#14). Decided against: the sidecar backend (#4), since root already covers rootful runtimes. Macvtap VMs (#1), VM-to-VM traffic (#2), `--duration` as root (#5) and Docker (#4, in CI) are done and measured.
 
 ## 10. Revision history
 
