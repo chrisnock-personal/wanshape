@@ -571,5 +571,42 @@ class FifthReviewTests(unittest.TestCase):
         self.assertTrue(plan.replaces)
 
 
+class SixthReviewTests(unittest.TestCase):
+    def test_non_table_profile_is_skipped(self):
+        profiles, err = FifthReviewTests.user_profiles(self, "[profiles]\nlte = 3\n")
+        self.assertIn("3g", profiles)
+        self.assertIn("expected a table", err)
+
+    def test_cancel_without_systemctl_is_harmless(self):
+        from tests import REAL_TIMER
+        with mock.patch("subprocess.run", side_effect=FileNotFoundError("systemctl")):
+            REAL_TIMER["cancel"]("wanshape-clear-host-x")
+
+    def test_clear_without_state_removes_a_clsact_holding_our_filter(self):
+        shaped = LiveState("netem", "5753:", True, True, True)
+        backend = FakeBackend()
+        with mock.patch.object(cli, "get_backend", return_value=backend), \
+                mock.patch.object(cli, "inspect_live",
+                                  side_effect=[shaped, LiveState("noqueue", "0:", False, False,
+                                                                 False)]), \
+                mock.patch.object(cli, "load_state", return_value={}), \
+                mock.patch.object(cli, "save_state"), \
+                mock.patch.object(Target, "verify", return_value=None), \
+                mock.patch("sys.stdout", new_callable=io.StringIO):
+            cli._clear_container(target(), argparse.Namespace(direction="both", dry_run=False))
+        self.assertIn(["tc", "qdisc", "del", "dev", "eth0", "clsact"], backend.commands)
+
+    def test_host_clear_leaves_another_tools_filter_in_our_band(self):
+        slot = HostSlot(2, "t", "3g", "eth0", parse_ports("5060"), "both", True)
+        live = HostLive(slots={2: slot}, ifbs={"wsh2up", "wsh2dn"},
+                        ifaces={"eth0": IfaceState(clsact=True,
+                                                   egress_prefs={49500, 49501, 50510},
+                                                   ingress_prefs={49500, 49501})})
+        commands = [" ".join(c) for c in host.build_host_clear(slot, live)]
+        self.assertIn("tc filter del dev eth0 egress pref 49500", commands)
+        self.assertNotIn("tc filter del dev eth0 egress pref 50510", commands)
+        self.assertNotIn("tc qdisc del dev eth0 clsact", commands)   # 50510 is still there
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -382,12 +382,16 @@ class _Commands:
 def _clear_container(target: Target, args: argparse.Namespace) -> None:
     """Clear one container target (any member of a shared namespace)."""
     backend = get_backend(target, "auto")
-    entry = _entry_for(load_state(), target) or {}
+    entry = _entry_for(load_state(), target)
     target.verify()
     live = inspect_live(backend, target.iface)
+    # With no state record (pruned, another user, a pre-0.4 file), a clsact that
+    # holds wanshape's own filter is taken to be wanshape's.
+    added_clsact = (bool(entry.get("added_clsact")) if entry and "added_clsact" in entry
+                    else live.our_filter)
+    entry = entry or {}
     plan = build_clear_plan(
-        target.iface, args.direction, live, bool(entry.get("added_clsact")),
-        entry.get("prior_root_qdisc"),
+        target.iface, args.direction, live, added_clsact, entry.get("prior_root_qdisc"),
     )
     if plan.empty:
         print(f"{target.name}: nothing to clear")
@@ -678,7 +682,12 @@ def _vm_hook(args: argparse.Namespace) -> int:
             live = inspect_host(backend, [device])
             plan = build_host_apply(name, profile, [], device, direction, live, kind="vm",
                                     device=device_type, mac=mac)
-            run_plan(backend, plan.commands)
+            try:
+                run_plan(backend, plan.commands)
+            except WanshapeError:
+                if plan.slot.added_clsact:   # e.g. one taken over from a stale slot
+                    _tidy_clsact(backend, device)
+                raise
 
         def release_fn(name):
             live = inspect_host(backend)

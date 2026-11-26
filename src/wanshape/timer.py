@@ -90,9 +90,12 @@ def schedule(unit: str, seconds: int, clear_args: list[str]) -> None:
 
 
 def cancel(unit: str) -> None:
-    """Stop a pending timer, if any (no error when there is none)."""
-    subprocess.run(_systemctl("stop", f"{unit}.timer"), capture_output=True)
-    subprocess.run(_systemctl("reset-failed", f"{unit}.service"), capture_output=True)
+    """Stop a pending timer, if any (no error when there is none, or no systemd)."""
+    try:
+        subprocess.run(_systemctl("stop", f"{unit}.timer"), capture_output=True)
+        subprocess.run(_systemctl("reset-failed", f"{unit}.service"), capture_output=True)
+    except OSError:
+        pass   # no systemctl: then no timer can have been scheduled either
 
 
 def until(seconds: int) -> int:

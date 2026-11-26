@@ -385,6 +385,8 @@ _PROFILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")   # used with ful
 
 
 def _profile_from(name: str, raw: dict) -> Profile:
+    if not isinstance(raw, dict):
+        raise ProfileError(f"{name}: expected a table of settings, got {type(raw).__name__}")
     if not _PROFILE_NAME.fullmatch(name):
         raise ProfileError(f"invalid profile name {name!r}: letters, digits, '.', '_', '-'")
     unknown = set(raw) - {"description", "reorder_on_jitter", "rate_mode", "up", "down"}

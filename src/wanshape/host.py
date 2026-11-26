@@ -589,15 +589,31 @@ def _free_slot(live: HostLive, iface: str) -> int:
     )
 
 
+def slot_filter_prefs(slot: HostSlot) -> dict[str, set[int]]:
+    """The prefs this slot's filters occupy, per hook: in the current layout
+    (remote-side filters in the upper band) and in the pre-0.4 one (all filters
+    in the local band), so a clear removes exactly its own filters, never
+    another tool's that happen to sit in the same range."""
+    used: dict[str, set[int]] = {"egress": set(), "ingress": set()}
+    current = {(h, r): iter(slot_prefs(slot.slot, r))
+               for h in ("egress", "ingress") for r in (False, True)}
+    legacy = {h: iter(slot_prefs(slot.slot)) for h in ("egress", "ingress")}
+    for hook, _match, _ifb, remote in slot.filters():
+        used[hook].add(next(current[(hook, remote)]))
+        used[hook].add(next(legacy[hook]))
+    return used
+
+
 def build_host_clear(slot: HostSlot, live: HostLive, keep_clsact: bool = False) -> list[Command]:
     state = live.iface(slot.iface)
     commands: list[Command] = []
-    ours = all_slot_prefs(slot.slot)
+    own = slot_filter_prefs(slot)
+    ours = own["egress"] | own["ingress"]
     if not state.exists:
         # The device is gone (and its filters with it): only our IFBs remain.
         return [["ip", "link", "del", dev] for dev in (slot.up, slot.down) if dev in live.ifbs]
     for hook in ("egress", "ingress"):
-        for pref in sorted(state.prefs(hook) & ours):
+        for pref in sorted(state.prefs(hook) & own[hook]):
             commands.append(["tc", "filter", "del", "dev", slot.iface, hook, "pref", str(pref)])
     for dev in (slot.up, slot.down):
         if dev in live.ifbs:
