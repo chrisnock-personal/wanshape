@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import sys
 import xml.etree.ElementTree as ET
 from dataclasses import asdict
@@ -88,7 +89,8 @@ def hook_script() -> str:
         "#!/bin/sh\n"
         "# Installed by `wanshape install-vm-hook`: re-applies wanshape VM shaping\n"
         "# when libvirt starts a VM. Remove with `wanshape uninstall-vm-hook`.\n"
-        f"PYTHONPATH={package_root} exec {sys.executable} -m wanshape.cli vm-hook \"$@\"\n"
+        f"PYTHONPATH={shlex.quote(str(package_root))} exec {shlex.quote(sys.executable)} "
+        "-m wanshape.cli vm-hook \"$@\"\n"
     )
 
 
@@ -117,7 +119,7 @@ def run_hook(domain: str, operation: str, sub_operation: str, xml_text: str,
         if not device:
             raise WanshapeError(f"no interface with MAC {entry['mac']} in the domain XML")
         apply_fn(domain, profile_from(entry), entry["direction"], device,
-                 entry.get("device", "tap"))
+                 entry.get("device", "tap"), entry["mac"])
         return f"re-applied to {device}"
     if (operation, sub_operation) == ("release", "end"):
         release_fn(domain)

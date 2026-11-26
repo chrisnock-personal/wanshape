@@ -25,6 +25,12 @@ class Target:
     network_mode: str
     iface: str
     owner_uid: int
+    pod: str = ""   # Podman pod ID; members share the infra container's namespace
+
+    @property
+    def owns_netns(self) -> bool:
+        """False for pod members and --network container:X (another owns the netns)."""
+        return not self.pod and not self.network_mode.startswith("container:")
 
     def verify(self) -> None:
         """Re-check the netns inode immediately before mutating it (TOCTOU guard)."""
@@ -106,6 +112,7 @@ def _build_target(runtime: str, obj: dict, name: str, iface: str | None) -> Targ
         netns_inode=netns_inode,
         userns_inode=userns_inode,
         network_mode=mode,
+        pod=str(obj.get("Pod") or ""),
         iface=iface or "",
         owner_uid=owner_uid,
     )

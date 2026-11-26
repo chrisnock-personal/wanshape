@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import shlex
+import sys
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -380,7 +381,14 @@ def _direction_from(label: str, raw: dict) -> Direction:
     return Direction(**{k: str(v) for k, v in raw.items()})
 
 
+_PROFILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")   # used with fullmatch
+
+
 def _profile_from(name: str, raw: dict) -> Profile:
+    if not isinstance(raw, dict):
+        raise ProfileError(f"{name}: expected a table of settings, got {type(raw).__name__}")
+    if not _PROFILE_NAME.fullmatch(name):
+        raise ProfileError(f"invalid profile name {name!r}: letters, digits, '.', '_', '-'")
     unknown = set(raw) - {"description", "reorder_on_jitter", "rate_mode", "up", "down"}
     if unknown:
         raise ProfileError(f"{name}: unknown setting(s) {', '.join(sorted(unknown))}")
@@ -394,19 +402,62 @@ def _profile_from(name: str, raw: dict) -> Profile:
     )
 
 
+def _config_home() -> Path:
+    """$XDG_CONFIG_HOME, else ~/.config; under sudo, the invoking user's ~/.config."""
+    if os.environ.get("XDG_CONFIG_HOME"):
+        return Path(os.environ["XDG_CONFIG_HOME"])
+    sudo_user = os.environ.get("SUDO_USER")
+    if os.geteuid() == 0 and sudo_user and sudo_user != "root":
+        try:
+            import pwd
+            return Path(pwd.getpwnam(sudo_user).pw_dir) / ".config"
+        except KeyError:
+            pass
+    return Path.home() / ".config"
+
+
 def load_profiles() -> dict[str, Profile]:
     """Load built-ins, then overlay the user's config file."""
     data = tomllib.loads(BUILTIN_TOML)
-    config = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    config = _config_home()
     user_file = config / "wanshape" / "profiles.toml"
-    if user_file.is_file():
-        with user_file.open("rb") as fh:
-            user_data = tomllib.load(fh).get("profiles", {})
+    user_names: set[str] = set()
+    builtins = dict(data.get("profiles", {}))
+    user_data: dict = {}
+    try:
+        if user_file.is_file():
+            with user_file.open("rb") as fh:
+                user_data = tomllib.load(fh).get("profiles", {})
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        # Unreadable or not valid TOML: carry on with the built-ins.
+        print(f"wanshape: ignoring {user_file}: {exc}", file=sys.stderr)
+        user_data = {}
+    if not isinstance(user_data, dict):
+        user_data = {}
+    if user_data:
         for name, raw in user_data.items():
+            if not _PROFILE_NAME.fullmatch(str(name)):
+                # Skip it rather than break every command, built-ins included.
+                print(f"wanshape: skipping profile {name!r} in {user_file}: names use "
+                      "letters, digits, '.', '_' and '-'", file=sys.stderr)
+                continue
             data.setdefault("profiles", {})[name] = raw
-    profiles = {
-        name: _profile_from(name, raw) for name, raw in data.get("profiles", {}).items()
-    }
-    for profile in profiles.values():
-        profile.validate()
+            user_names.add(name)
+    profiles: dict[str, Profile] = {}
+    for name, raw in data.get("profiles", {}).items():
+        try:
+            profile = _profile_from(name, raw)
+            profile.validate()
+        except ProfileError as exc:
+            if name not in user_names:
+                raise   # a built-in must be valid
+            # A bad user profile is skipped, not fatal for every command; if it
+            # overrode a built-in, the built-in stays.
+            fallback = " (using the built-in)" if name in builtins else ""
+            print(f"wanshape: skipping profile {name!r} in {user_file}: {exc}{fallback}",
+                  file=sys.stderr)
+            if name in builtins:
+                profiles[name] = _profile_from(name, builtins[name])
+            continue
+        profiles[name] = profile
     return profiles

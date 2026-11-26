@@ -50,7 +50,7 @@ class VmHookTests(unittest.TestCase):
         self.assertEqual(self.vmhook.run_hook("web", "started", "begin", XML, apply_fn, release_fn),
                          "re-applied to vnet7")
         self.assertEqual(applied[0][0], "web")
-        self.assertEqual(applied[0][2:], ("egress", "vnet7", "tap"))
+        self.assertEqual(applied[0][2:], ("egress", "vnet7", "tap", "52:54:00:aa:bb:01"))
         self.vmhook.run_hook("web", "release", "end", XML, apply_fn, release_fn)
         self.assertEqual(released, ["web"])
         self.assertEqual(self.vmhook.run_hook("other", "started", "begin", XML, apply_fn,

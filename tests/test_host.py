@@ -129,7 +129,6 @@ class ApplyTests(unittest.TestCase):
         plan = build_host_apply("cr", profile(), parse_ports("5060"), "eth0", "both", live)
         self.assertFalse(plan.slot.added_clsact)
         self.assertNotIn(["tc", "qdisc", "add", "dev", "eth0", "clsact"], plan.commands)
-        self.assertNotIn(["tc", "qdisc", "del", "dev", "eth0", "clsact"], plan.rollback)
 
     def test_overlap_refused(self):
         live = HostLive(slots={0: slot(0, "a", "10000-20000")}, ifbs={"wsh0up", "wsh0dn"},

@@ -1,0 +1,612 @@
+"""Regression tests for the bug hunt of 2026-11-25."""
+
+import argparse
+import io
+import unittest
+from unittest import mock
+
+from tests.fakes import FakeBackend
+from tests.test_cli import args, target
+from wanshape import cli, host, timer
+from wanshape.errors import CommandError, ConflictError, WanshapeError
+from wanshape.host import HostLive, HostSlot, IfaceState, build_host_apply, parse_ports
+from wanshape.inspector import LiveState
+from wanshape.planner import build_clear_plan
+from wanshape.profiles import ProfileError, _profile_from, load_profiles
+from wanshape.target import Target
+
+
+class RollbackScopeTests(unittest.TestCase):
+    """1: a failed apply undoes only what it created."""
+
+    def test_existing_ifb_is_not_deleted(self):
+        backend = FakeBackend()
+
+        def run(cmd):
+            backend.commands.append(list(cmd))
+            if cmd[:4] == ["ip", "link", "add", "wsh0up"]:
+                raise CommandError(cmd, 2, "RTNETLINK answers: File exists")
+            return ""
+        backend.run = run
+        plan = build_host_apply("b", load_profiles()["3g"], parse_ports("6000"), "eth0",
+                                "both", HostLive())
+        with self.assertRaises(CommandError):
+            host.run_plan(backend, plan.commands)
+        self.assertNotIn(["ip", "link", "del", "wsh0up"], backend.commands)
+        self.assertNotIn(["ip", "link", "del", "wsh0dn"], backend.commands)
+
+    def test_what_was_created_is_undone_in_reverse(self):
+        backend = FakeBackend()
+
+        def run(cmd):
+            backend.commands.append(list(cmd))
+            if cmd[:3] == ["tc", "filter", "add"] and cmd[7] == "49301":
+                raise CommandError(cmd, 2, "boom")
+            return ""
+        backend.run = run
+        plan = build_host_apply("b", load_profiles()["3g"], parse_ports("6000"), "eth0",
+                                "both", HostLive())
+        with self.assertRaises(CommandError):
+            host.run_plan(backend, plan.commands)
+        tail = backend.commands[-4:]
+        self.assertEqual(tail, [
+            ["tc", "filter", "del", "dev", "eth0", "egress", "pref", "49300"],
+            ["tc", "qdisc", "del", "dev", "eth0", "clsact"],
+            ["ip", "link", "del", "wsh0dn"],
+            ["ip", "link", "del", "wsh0up"],
+        ])
+
+
+class OverlapTests(unittest.TestCase):
+    """2: local against remote ports; different peers never clash."""
+
+    def live_with(self, **kw):
+        ports = kw.pop("ports", [])
+        other = HostSlot(0, "a", "3g", "eth0", ports, "both", True, **kw)
+        return HostLive(slots={0: other}, ifbs={"wsh0up", "wsh0dn"},
+                        ifaces={"eth0": IfaceState(clsact=True)})
+
+    def test_local_port_beats_another_targets_remote_port(self):
+        """Second review: local-vs-remote is settled by precedence, not refused."""
+        live = self.live_with(remote_ports=parse_ports("5060"))
+        plan = build_host_apply("b", load_profiles()["3g"], parse_ports("6000"), "eth0", "both",
+                                live)
+        local_prefs = [int(c[7]) for c in plan.commands if c[:3] == ["tc", "filter", "add"]]
+        # Target a's remote-port filters sit in the band above every local-port one.
+        self.assertTrue(all(p < host.REMOTE_PREF_BASE for p in local_prefs))
+        remote_plan = build_host_apply("c", load_profiles()["3g"], [], "eth0", "both",
+                                       HostLive(), remote_ports=parse_ports("5060"))
+        remote_prefs = [int(c[7]) for c in remote_plan.commands
+                        if c[:3] == ["tc", "filter", "add"]]
+        self.assertTrue(all(p >= host.REMOTE_PREF_BASE for p in remote_prefs))
+
+    def test_overlapping_remote_ports_and_peer_only_still_refused(self):
+        live = self.live_with(remote_ports=parse_ports("8000-9000"))
+        with self.assertRaises(ConflictError):
+            build_host_apply("b", load_profiles()["3g"], [], "eth0", "both", live,
+                             remote_ports=parse_ports("8088"))
+        with self.assertRaises(ConflictError):   # peer-only vs a remote-side target
+            build_host_apply("b", load_profiles()["3g"], [], "eth0", "both", live,
+                             peer="10.0.0.1")
+        local = self.live_with(ports=parse_ports("5060"))
+        build_host_apply("b", load_profiles()["3g"], [], "eth0", "both", local,
+                         peer="10.0.0.1")   # peer-only vs local ports: precedence
+
+    def test_different_peers_are_fine(self):
+        live = self.live_with(peer="10.0.0.1")
+        live.slots[0].ports = parse_ports("5060")
+        build_host_apply("b", load_profiles()["3g"], parse_ports("5060"), "eth0", "both",
+                         live, peer="10.0.0.2")
+
+
+class ContainerClearTests(unittest.TestCase):
+    def test_clsact_with_another_tools_filters_is_kept_even_if_we_added_it(self):
+        """4"""
+        live = LiveState("netem", "5753:", True, True, True, foreign_filters=True)
+        plan = build_clear_plan("eth0", "both", live, added_clsact=True)
+        self.assertNotIn(["tc", "qdisc", "del", "dev", "eth0", "clsact"], plan.commands)
+
+
+class TimerUnitTests(unittest.TestCase):
+    def test_container_timer_is_per_namespace_and_keeps_iface(self):
+        """3 and 6"""
+        a = Target(name="a", id="ida", runtime="podman", rootless=True, pid=1, netns_inode=99,
+                   userns_inode=1, network_mode="bridge", iface="eth1", owner_uid=1000)
+        b = Target(name="b", id="idb", runtime="podman", rootless=True, pid=2, netns_inode=99,
+                   userns_inode=1, network_mode="container:x", iface="eth1", owner_uid=1000)
+        self.assertEqual(cli._container_unit(a), cli._container_unit(b))
+        backend = FakeBackend()
+        clean = LiveState("noqueue", "0:", False, False, False)
+        plan = cli.build_apply_plan(load_profiles()["3g"], "eth1", "egress", clean)
+        with mock.patch.object(timer, "schedule") as schedule, \
+                mock.patch.object(cli, "_save_and_report"), \
+                mock.patch.object(cli, "netns_members", return_value=[]), \
+                mock.patch.object(Target, "verify", return_value=None):
+            ok = cli._apply_container((a, backend, clean, plan), args(container=["a"]),
+                                      load_profiles()["3g"], 300)
+        self.assertTrue(ok)
+        clear_args = schedule.call_args[0][2]
+        self.assertEqual(clear_args[-6:], ["--iface", "eth1", "--only-netns", "99",
+                                           "--only-pid", "1"])
+
+    def test_unit_names_have_no_dots_and_dont_collide(self):
+        self.assertNotIn(".", timer.unit_name("vm", "web.service"))
+        self.assertNotEqual(timer.unit_name("host", "web.1"), timer.unit_name("host", "web_1"))
+        self.assertEqual(timer.legacy_unit_names("container", "web.1"),
+                         ["wanshape-clear-container-web.1"])
+
+    def test_timer_failure_rolls_the_container_back(self):
+        """8"""
+        backend = FakeBackend()
+        t = target()
+        clean = LiveState("noqueue", "0:", False, False, False)
+        plan = cli.build_apply_plan(load_profiles()["3g"], "eth0", "egress", clean)
+        with mock.patch.object(timer, "schedule", side_effect=WanshapeError("no systemd")), \
+                mock.patch.object(cli, "netns_members", return_value=[]), \
+                mock.patch.object(cli, "_rollback") as rollback, \
+                mock.patch.object(Target, "verify", return_value=None), \
+                mock.patch("sys.stderr", new_callable=io.StringIO):
+            ok = cli._apply_container((t, backend, clean, plan), args(), load_profiles()["3g"], 60)
+        self.assertFalse(ok)
+        rollback.assert_called_once()
+
+    def test_vanishing_target_is_a_failure_not_a_crash(self):
+        """8"""
+        backend = FakeBackend()
+        t = target()
+        clean = LiveState("noqueue", "0:", False, False, False)
+        plan = cli.build_apply_plan(load_profiles()["3g"], "eth0", "egress", clean)
+        with mock.patch.object(Target, "verify", side_effect=WanshapeError("gone")), \
+                mock.patch.object(cli, "_rollback") as rollback, \
+                mock.patch("sys.stderr", new_callable=io.StringIO):
+            ok = cli._apply_container((t, backend, clean, plan), args(), load_profiles()["3g"],
+                                      None)
+        self.assertFalse(ok)
+        rollback.assert_called_once()
+
+
+class PartialClearTests(unittest.TestCase):
+    """5: clearing one direction keeps the other's state."""
+
+    def test_entry_kept_while_egress_remains(self):
+        state = {"abc": {"id": "abc", "netns_inode": 42, "profile": "3g",
+                         "direction": "both", "until": 123}}
+        saved = {}
+        shaped = LiveState("netem", "5753:", True, True, True)
+        egress_only = LiveState("netem", "5753:", False, False, False)
+        with mock.patch.object(cli, "get_backend", return_value=FakeBackend()), \
+                mock.patch.object(cli, "inspect_live", side_effect=[shaped, egress_only]), \
+                mock.patch.object(cli, "load_state", side_effect=lambda: dict(state)), \
+                mock.patch.object(cli, "save_state", side_effect=saved.update), \
+                mock.patch.object(timer, "cancel") as cancel, \
+                mock.patch.object(Target, "verify", return_value=None), \
+                mock.patch("sys.stdout", new_callable=io.StringIO):
+            cli._clear_container(target(), argparse.Namespace(direction="ingress",
+                                                              dry_run=False))
+        cancel.assert_not_called()
+        self.assertEqual(saved["abc"]["direction"], "egress")
+
+
+class NameTests(unittest.TestCase):
+    def test_profile_names_cannot_inject_alias_fields(self):
+        """7"""
+        for bad in ("x kind=vm", "a b", "x=y", ""):
+            with self.assertRaises(ProfileError, msg=bad):
+                _profile_from(bad, {"up": {"delay": "5ms"}})
+
+
+class StaleVmTests(unittest.TestCase):
+    def test_takeover_keeps_the_clsact_record(self):
+        old = HostSlot(0, "vm-a", "3g", "vnet0", [], "both", True, kind="vm",
+                       mac="52:54:00:00:00:0a")
+        live = HostLive(slots={0: old}, ifbs={"wsh0up", "wsh0dn"},
+                        ifaces={"vnet0": IfaceState(clsact=True)})
+        plan = build_host_apply("vm-b", load_profiles()["3g"], [], "vnet0", "both", live,
+                                kind="vm", mac="52:54:00:00:00:0b")
+        self.assertTrue(plan.slot.added_clsact)
+
+    def test_tap_name_reused_by_another_vm_is_taken_over(self):
+        old = HostSlot(0, "vm-a", "3g", "vnet0", [], "both", True, kind="vm",
+                       mac="52:54:00:00:00:0a")
+        live = HostLive(slots={0: old}, ifbs={"wsh0up", "wsh0dn"},
+                        ifaces={"vnet0": IfaceState(clsact=True, egress_prefs={49300},
+                                                    ingress_prefs={49300})})
+        plan = build_host_apply("vm-b", load_profiles()["3g"], [], "vnet0", "both", live,
+                                kind="vm", mac="52:54:00:00:00:0b")
+        self.assertIn(["ip", "link", "del", "wsh0up"], plan.commands)
+        self.assertEqual(plan.slot.name, "vm-b")
+
+    def test_same_vm_on_same_device_still_conflicts_with_a_ports_target(self):
+        other = HostSlot(0, "p", "3g", "vnet0", parse_ports("5060"), "both", True)
+        live = HostLive(slots={0: other}, ifbs={"wsh0up", "wsh0dn"},
+                        ifaces={"vnet0": IfaceState(clsact=True)})
+        with self.assertRaises(ConflictError):
+            build_host_apply("vm-b", load_profiles()["3g"], [], "vnet0", "both", live,
+                             kind="vm", mac="52:54:00:00:00:0b")
+
+
+class SudoProfileTests(unittest.TestCase):
+    def test_profiles_come_from_the_sudo_users_home(self):
+        import os
+        import pwd
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as home:
+            cfg = Path(home) / ".config" / "wanshape"
+            cfg.mkdir(parents=True)
+            (cfg / "profiles.toml").write_text('[profiles.mine.up]\ndelay = "5ms"\n')
+            env = {k: v for k, v in os.environ.items() if k != "XDG_CONFIG_HOME"}
+            env["SUDO_USER"] = "someone"
+            entry = mock.Mock(pw_dir=home)
+            with mock.patch.dict(os.environ, env, clear=True), \
+                    mock.patch("os.geteuid", return_value=0), \
+                    mock.patch.object(pwd, "getpwnam", return_value=entry):
+                self.assertIn("mine", load_profiles())
+
+
+class CanonicalNameTests(unittest.TestCase):
+    def test_uuid_becomes_the_name(self):
+        from wanshape.vm import canonical_name
+        self.assertEqual(canonical_name("3f2a-uuid", virsh=lambda uri, *a: "web\n"), "web")
+
+        def missing(uri, *a):
+            raise WanshapeError("no domain")
+        self.assertEqual(canonical_name("nope", virsh=missing), "nope")
+
+
+class LockTests(unittest.TestCase):
+    """Review of #19: the lock is root-only and the hook never waits forever."""
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name) / "wanshape"
+        patcher = mock.patch.object(host, "LOCK_DIR", self.dir)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def as_root(self):
+        import os
+        real_lstat = os.lstat
+
+        def lstat(path):
+            st = real_lstat(path)
+            return mock.Mock(st_mode=st.st_mode, st_uid=0)
+        return mock.patch("os.geteuid", return_value=0), mock.patch("os.lstat", side_effect=lstat)
+
+    def test_no_root_no_lock(self):
+        with mock.patch("os.geteuid", return_value=1000):
+            with host.host_lock():
+                pass
+        self.assertFalse(self.dir.exists())
+
+    def test_writable_by_others_is_refused(self):
+        import os
+        self.dir.mkdir()
+        os.chmod(self.dir, 0o777)
+        euid, lstat = self.as_root()
+        with euid, lstat, self.assertRaises(WanshapeError):
+            with host.host_lock():
+                pass
+
+    def test_hook_gives_up_after_its_timeout(self):
+        import fcntl
+        import os
+        euid, lstat = self.as_root()
+        with euid, lstat:
+            with host.host_lock():            # holds the lock (creates the dir)
+                fd = os.open(self.dir / "lock", os.O_RDWR)
+                self.addCleanup(os.close, fd)
+            fcntl.flock(fd, fcntl.LOCK_EX)    # someone else holds it now
+            with self.assertRaisesRegex(WanshapeError, "held the lock"):
+                with host.host_lock(timeout=0.3):
+                    pass
+
+
+class ProfileNameSkipTests(unittest.TestCase):
+    def test_bad_user_profile_name_is_skipped_not_fatal(self):
+        import os
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as cfg:
+            (Path(cfg) / "wanshape").mkdir()
+            (Path(cfg) / "wanshape" / "profiles.toml").write_text(
+                '[profiles."voip+jitter".up]\ndelay = "5ms"\n[profiles.ok.up]\ndelay = "5ms"\n')
+            with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": cfg}), \
+                    mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+                profiles = load_profiles()
+        self.assertIn("ok", profiles)
+        self.assertIn("3g", profiles)
+        self.assertNotIn("voip+jitter", profiles)
+        self.assertIn("skipping profile", err.getvalue())
+
+
+class ClearVmByUuidTests(unittest.TestCase):
+    def test_uuid_is_turned_into_the_name(self):
+        slot = HostSlot(0, "web", "3g", "vnet0", [], "both", True, kind="vm")
+        live = HostLive(slots={0: slot}, ifbs={"wsh0up", "wsh0dn"},
+                        ifaces={"vnet0": IfaceState(clsact=True)})
+        a = argparse.Namespace(name=["3f2a-uuid"], all=False, dry_run=True,
+                               command="clear-vm", connect="qemu:///system")
+        with mock.patch.object(cli, "inspect_host", return_value=live), \
+                mock.patch.object(cli.vmhook, "load", return_value={}), \
+                mock.patch.object(cli, "canonical_name", return_value="web") as canon, \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            cli._clear_host(a)
+        canon.assert_called_once_with("3f2a-uuid", "qemu:///system")
+        self.assertIn("ip link del wsh0up", out.getvalue())
+
+
+class HookLockTests(unittest.TestCase):
+    def test_hook_ignores_other_vms_without_the_lock(self):
+        a = argparse.Namespace(hook_args=["other-vm", "started", "begin", "-"])
+        with mock.patch.object(cli.vmhook, "load", return_value={}), \
+                mock.patch.object(cli, "host_lock") as lock, \
+                mock.patch("sys.stdin", new_callable=io.StringIO):
+            self.assertEqual(cli._vm_hook(a), 0)
+        lock.assert_not_called()
+
+    def test_hook_ignores_operations_it_doesnt_act_on(self):
+        a = argparse.Namespace(hook_args=["web", "prepare", "begin", "-"])
+        with mock.patch.object(cli.vmhook, "load", return_value={"web": {}}), \
+                mock.patch.object(cli, "host_lock") as lock, \
+                mock.patch("sys.stdin", new_callable=io.StringIO):
+            self.assertEqual(cli._vm_hook(a), 0)
+        lock.assert_not_called()
+
+
+class CleanupFailureTests(unittest.TestCase):
+    def test_undo_errors_dont_stop_the_bookkeeping(self):
+        plans = []
+        live = HostLive()
+        for name, port in (("a", "6000"), ("b", "6001")):
+            plan = build_host_apply(name, load_profiles()["3g"], parse_ports(port), "eth0",
+                                    "both", live)
+            cli._simulate(live, plan)
+            plans.append((name, plan))
+        backend = FakeBackend()
+
+        def run_plan(b, commands):
+            if any("wsh1up" in c for c in commands):
+                raise CommandError(["tc"], 2, "boom")
+        a = argparse.Namespace(keep_going=False, direction="both")
+        with mock.patch.object(cli, "run_plan", side_effect=run_plan), \
+                mock.patch.object(cli, "require_root"), \
+                mock.patch.object(cli, "_host_timer"), \
+                mock.patch.object(cli, "_undo_host_target",
+                                  side_effect=WanshapeError("device vanished")) as undo, \
+                mock.patch.object(cli, "_tidy_clsact"), \
+                mock.patch("sys.stdout", new_callable=io.StringIO), \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            code = cli._run_host_plans(backend, plans, a, load_profiles()["3g"], None)
+        self.assertEqual(code, 1)
+        # b's own failure is undone by run_plan; a, already applied, is undone here.
+        self.assertEqual([c.args[1] for c in undo.call_args_list], ["a"])
+        self.assertIn("could not undo", err.getvalue())
+
+
+class ThirdReviewTests(unittest.TestCase):
+    def test_timer_clear_skips_a_restarted_container(self):
+        a = argparse.Namespace(container=["web"], runtime=None, iface=None, direction="both",
+                               dry_run=False, only_netns=1)
+        with mock.patch.object(cli, "resolve", return_value=target()), \
+                mock.patch.object(cli, "_clear_container") as clear, \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            cli._Commands.clear(a)
+        clear.assert_not_called()
+        self.assertIn("restarted since this timer was set", out.getvalue())
+
+    def test_failed_run_plan_keeps_existing_shaping(self):
+        plan = build_host_apply("sip", load_profiles()["3g"], parse_ports("5060"), "eth0",
+                                "both", HostLive())
+        a = argparse.Namespace(keep_going=False, direction="both")
+        with mock.patch.object(cli, "run_plan", side_effect=CommandError(["tc"], 2, "x")), \
+                mock.patch.object(cli, "require_root"), \
+                mock.patch.object(cli, "_undo_host_target") as undo, \
+                mock.patch.object(cli, "_tidy_clsact"), \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            cli._run_host_plans(FakeBackend(), [("sip", plan)], a, load_profiles()["3g"], 60)
+        undo.assert_not_called()
+        self.assertIn("failed and was rolled back", err.getvalue())
+
+    def test_timer_failure_undoes_and_says_if_cleanup_failed(self):
+        plan = build_host_apply("sip", load_profiles()["3g"], parse_ports("5060"), "eth0",
+                                "both", HostLive())
+        a = argparse.Namespace(keep_going=False, direction="both")
+        with mock.patch.object(cli, "run_plan"), \
+                mock.patch.object(cli, "require_root"), \
+                mock.patch.object(cli, "_host_timer", side_effect=WanshapeError("no systemd")), \
+                mock.patch.object(cli, "_undo_host_target", side_effect=WanshapeError("tc")), \
+                mock.patch.object(cli, "_tidy_clsact"), \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            cli._run_host_plans(FakeBackend(), [("sip", plan)], a, load_profiles()["3g"], 60)
+        self.assertIn("only partly rolled back", err.getvalue())
+
+    def test_pre_upgrade_remote_target_still_refuses_local_ports(self):
+        old = HostSlot(0, "a", "3g", "eth0", [], "both", True, peer="10.0.0.1")
+        live = HostLive(slots={0: old}, ifbs={"wsh0up", "wsh0dn"},
+                        ifaces={"eth0": IfaceState(clsact=True, egress_prefs={49300})})
+        with self.assertRaisesRegex(ConflictError, "older wanshape"):
+            build_host_apply("b", load_profiles()["3g"], parse_ports("5060"), "eth0", "both",
+                             live)
+        live.ifaces["eth0"].egress_prefs = {50300}   # re-applied: now in the remote band
+        build_host_apply("b", load_profiles()["3g"], parse_ports("5060"), "eth0", "both", live)
+
+
+class FourthReviewTests(unittest.TestCase):
+    def test_timer_clear_checks_the_pid_too(self):
+        """A restarted container can get the same namespace inode back."""
+        a = argparse.Namespace(container=["web"], runtime=None, iface=None, direction="both",
+                               dry_run=False, only_netns=42, only_pid=999)
+        with mock.patch.object(cli, "resolve", return_value=target()), \
+                mock.patch.object(cli, "_clear_container") as clear, \
+                mock.patch("sys.stdout", new_callable=io.StringIO):
+            cli._Commands.clear(a)
+        clear.assert_not_called()
+        a.only_pid = 1   # same container, not restarted
+        with mock.patch.object(cli, "resolve", return_value=target()), \
+                mock.patch.object(cli, "_clear_container") as clear:
+            cli._Commands.clear(a)
+        clear.assert_called_once()
+
+    def test_takeover_reuses_the_stale_slot_when_all_are_busy(self):
+        slots = {n: HostSlot(n, f"t{n}", "3g", f"vnet{n}", [], "both", True, kind="vm",
+                             mac=f"52:54:00:00:00:{n:02x}") for n in range(10)}
+        live = HostLive(slots=slots, ifbs={f"wsh{n}{d}" for n in range(10) for d in ("up", "dn")},
+                        ifaces={f"vnet{n}": IfaceState(clsact=True) for n in range(10)})
+        plan = build_host_apply("newvm", load_profiles()["3g"], [], "vnet4", "both", live,
+                                kind="vm", mac="52:54:00:00:00:ff")
+        self.assertEqual(plan.slot.slot, 4)
+        self.assertTrue(plan.replaces)
+
+    def test_failed_reapply_says_it_is_now_unshaped(self):
+        old = HostSlot(0, "sip", "3g", "eth0", parse_ports("5060"), "both", True)
+        live = HostLive(slots={0: old}, ifbs={"wsh0up", "wsh0dn"},
+                        ifaces={"eth0": IfaceState(clsact=True)})
+        plan = build_host_apply("sip", load_profiles()["4g"], parse_ports("5060"), "eth0",
+                                "both", live)
+        a = argparse.Namespace(keep_going=False, direction="both")
+        with mock.patch.object(cli, "run_plan", side_effect=CommandError(["tc"], 2, "x")), \
+                mock.patch.object(cli, "require_root"), \
+                mock.patch.object(cli, "_tidy_clsact"), \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            cli._run_host_plans(FakeBackend(), [("sip", plan)], a, load_profiles()["4g"], None)
+        self.assertIn("now unshaped", err.getvalue())
+
+    def test_unquoted_dotted_profile_name_is_skipped(self):
+        import os
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as cfg:
+            (Path(cfg) / "wanshape").mkdir()
+            (Path(cfg) / "wanshape" / "profiles.toml").write_text(
+                '[profiles.lte.v2.up]\ndelay = "5ms"\n[profiles."lte.v3".up]\ndelay = "6ms"\n')
+            with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": cfg}), \
+                    mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+                profiles = load_profiles()
+        self.assertIn("lte.v3", profiles)
+        self.assertNotIn("lte", profiles)
+        self.assertIn("skipping profile 'lte'", err.getvalue())
+
+
+class FifthReviewTests(unittest.TestCase):
+    def test_pod_member_timer_has_no_pid_guard(self):
+        member = Target(name="web", id="idw", runtime="podman", rootless=True, pid=5,
+                        netns_inode=77, userns_inode=1, network_mode="bridge", iface="eth0",
+                        owner_uid=1000, pod="podid")
+        self.assertFalse(member.owns_netns)
+        clean = LiveState("noqueue", "0:", False, False, False)
+        plan = cli.build_apply_plan(load_profiles()["3g"], "eth0", "egress", clean)
+        with mock.patch.object(timer, "schedule") as schedule, \
+                mock.patch.object(timer, "cancel_legacy") as legacy, \
+                mock.patch.object(cli, "_save_and_report"), \
+                mock.patch.object(cli, "netns_members", return_value=["infra", "db"]), \
+                mock.patch.object(Target, "verify", return_value=None):
+            cli._apply_container((member, FakeBackend(), clean, plan), args(),
+                                 load_profiles()["3g"], 60)
+        self.assertNotIn("--only-pid", schedule.call_args[0][2])
+        self.assertEqual([c.args[1] for c in legacy.call_args_list], ["web", "infra", "db"])
+
+    def test_failed_undo_keeps_the_timer_and_says_still_shaped(self):
+        plans = []
+        live = HostLive()
+        for name, port in (("a", "6000"), ("b", "6001")):
+            plan = build_host_apply(name, load_profiles()["3g"], parse_ports(port), "eth0",
+                                    "both", live)
+            cli._simulate(live, plan)
+            plans.append((name, plan))
+
+        def run_plan(b, commands):
+            if any("wsh1up" in c for c in commands):
+                raise CommandError(["tc"], 2, "boom")
+        a = argparse.Namespace(keep_going=False, direction="both")
+        with mock.patch.object(cli, "run_plan", side_effect=run_plan), \
+                mock.patch.object(cli, "require_root"), \
+                mock.patch.object(cli, "_host_timer"), \
+                mock.patch.object(cli, "_undo_host_target", side_effect=WanshapeError("tc")), \
+                mock.patch.object(cli, "_tidy_clsact"), \
+                mock.patch.object(timer, "cancel") as cancel, \
+                mock.patch("sys.stdout", new_callable=io.StringIO), \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            cli._run_host_plans(FakeBackend(), plans, a, load_profiles()["3g"], 60)
+        cancel.assert_not_called()
+        self.assertIn("still shaped", err.getvalue())
+        self.assertNotIn("a: undone", err.getvalue())
+
+    def user_profiles(self, text):
+        import os
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as cfg:
+            (Path(cfg) / "wanshape").mkdir()
+            (Path(cfg) / "wanshape" / "profiles.toml").write_text(text)
+            with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": cfg}), \
+                    mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+                return load_profiles(), err.getvalue()
+
+    def test_invalid_override_falls_back_to_the_built_in(self):
+        profiles, err = self.user_profiles('[profiles.3g.up]\ndelay = "bogus"\n')
+        self.assertEqual(profiles["3g"].up.delay, "150ms")
+        self.assertIn("using the built-in", err)
+
+    def test_broken_toml_is_ignored_with_a_warning(self):
+        profiles, err = self.user_profiles('[profiles.x\n')
+        self.assertIn("3g", profiles)
+        self.assertIn("ignoring", err)
+
+    def test_trailing_newline_name_is_refused(self):
+        from wanshape.profiles import _profile_from
+        with self.assertRaises(ProfileError):
+            _profile_from("lte\n", {"up": {"delay": "5ms"}})
+
+    def test_pre_upgrade_vm_slot_without_mac_is_taken_over(self):
+        old = HostSlot(0, "vm-a", "3g", "vnet0", [], "both", True, kind="vm")   # no mac
+        live = HostLive(slots={0: old}, ifbs={"wsh0up", "wsh0dn"},
+                        ifaces={"vnet0": IfaceState(clsact=True)})
+        plan = build_host_apply("vm-b", load_profiles()["3g"], [], "vnet0", "both", live,
+                                kind="vm", mac="52:54:00:00:00:0b")
+        self.assertEqual(plan.slot.slot, 0)
+        self.assertTrue(plan.replaces)
+
+
+class SixthReviewTests(unittest.TestCase):
+    def test_non_table_profile_is_skipped(self):
+        profiles, err = FifthReviewTests.user_profiles(self, "[profiles]\nlte = 3\n")
+        self.assertIn("3g", profiles)
+        self.assertIn("expected a table", err)
+
+    def test_cancel_without_systemctl_is_harmless(self):
+        from tests import REAL_TIMER
+        with mock.patch("subprocess.run", side_effect=FileNotFoundError("systemctl")):
+            REAL_TIMER["cancel"]("wanshape-clear-host-x")
+
+    def test_clear_without_state_removes_a_clsact_holding_our_filter(self):
+        shaped = LiveState("netem", "5753:", True, True, True)
+        backend = FakeBackend()
+        with mock.patch.object(cli, "get_backend", return_value=backend), \
+                mock.patch.object(cli, "inspect_live",
+                                  side_effect=[shaped, LiveState("noqueue", "0:", False, False,
+                                                                 False)]), \
+                mock.patch.object(cli, "load_state", return_value={}), \
+                mock.patch.object(cli, "save_state"), \
+                mock.patch.object(Target, "verify", return_value=None), \
+                mock.patch("sys.stdout", new_callable=io.StringIO):
+            cli._clear_container(target(), argparse.Namespace(direction="both", dry_run=False))
+        self.assertIn(["tc", "qdisc", "del", "dev", "eth0", "clsact"], backend.commands)
+
+    def test_host_clear_leaves_another_tools_filter_in_our_band(self):
+        slot = HostSlot(2, "t", "3g", "eth0", parse_ports("5060"), "both", True)
+        live = HostLive(slots={2: slot}, ifbs={"wsh2up", "wsh2dn"},
+                        ifaces={"eth0": IfaceState(clsact=True,
+                                                   egress_prefs={49500, 49501, 50510},
+                                                   ingress_prefs={49500, 49501})})
+        commands = [" ".join(c) for c in host.build_host_clear(slot, live)]
+        self.assertIn("tc filter del dev eth0 egress pref 49500", commands)
+        self.assertNotIn("tc filter del dev eth0 egress pref 50510", commands)
+        self.assertNotIn("tc qdisc del dev eth0 clsact", commands)   # 50510 is still there
+
+
+if __name__ == "__main__":
+    unittest.main()

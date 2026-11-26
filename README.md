@@ -65,7 +65,7 @@ More netem options, as CLI flags (inline settings) or profile fields:
 
 `--rate-mode accurate` exists because tc-netem(8) warns that netem's own rate is affected by timer granularity. On Fedora's 7.3 kernel the two measured the same (TCP 3.76 vs 3.77 mbit/s at a 4 mbit/s cap, identical UDP loss and jitter), so it's opt-in, for kernels or VMs with coarser timers.
 
-Your own profiles go in `~/.config/wanshape/profiles.toml` and are added to the built-ins (or override them):
+Your own profiles go in `~/.config/wanshape/profiles.toml` and are added to the built-ins (or override them). Under `sudo`, wanshape reads the invoking user's file. Profile names use letters, digits, `.`, `_` and `-`; quote a name with a dot (`[profiles."lte.v2".up]`), or TOML reads it as nested tables. A profile wanshape can't read is skipped with a warning:
 
 ```toml
 [profiles.my-sip]
@@ -158,7 +158,7 @@ Things to know:
 - **`--peer ADDRESS` limits everything to one remote host**, such as the PBX. On its own (no ports) it shapes all traffic with that host, which is the simplest way to put one leg of a call on a bad network.
 - **Loopback isn't shaped.** Traffic between processes on the same host never reaches the interface.
 - **One interface per target.** Pick the one that carries the traffic you care about, for example with `--via <peer address>`.
-- Up to 10 host targets at once. Their ports must not overlap on the same interface.
+- Up to 10 host and VM targets at once. Two targets on one interface with overlapping local ports, or overlapping remote ports, are refused (unless they're limited to different peers). A packet from one target's local port is that target's, even if it also matches another target's remote port: local-port filters always run first. Host and VM changes take a lock, so two runs at once (or two VMs starting together) don't collide.
 - wanshape adds a `clsact` qdisc to the interface if there isn't one and removes it when the last host target is cleared, unless another tool has filters there.
 - Host mode keeps no state file. Each target's settings are stored in the alias of its `wsh<N>up` IFB device, so `status` and `clear-host` read them from the kernel.
 

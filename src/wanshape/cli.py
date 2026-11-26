@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import shlex
 import shutil
@@ -12,11 +13,12 @@ from pathlib import Path
 
 from . import timer, vmhook
 from .backends import get_backend
-from .errors import CommandError, WanshapeError
+from .errors import WanshapeError
 from .host import (
     HostBackend,
     build_host_apply,
     build_host_clear,
+    host_lock,
     host_ports_for,
     inspect_host,
     parse_ports,
@@ -30,7 +32,7 @@ from .planner import build_apply_plan, build_clear_plan
 from .profiles import Direction, Profile, ProfileError, load_profiles
 from .state import load_state, make_entry, save_state
 from .target import Target, netns_members, resolve
-from .vm import device_kind, resolve_vm
+from .vm import canonical_name, device_kind, resolve_vm
 
 EXIT_ERROR = 1
 EXIT_UNSUPPORTED = 2
@@ -110,6 +112,8 @@ def _parser() -> argparse.ArgumentParser:
                                 help="remove host-mode or VM shaping")
     clear_host.add_argument("name", nargs="*", help="target name(s)")
     clear_host.add_argument("--all", action="store_true", help="clear every host-mode target")
+    clear_host.add_argument("--connect", "-c", default="qemu:///system", metavar="URI",
+                            help="libvirt URI, to accept a VM's UUID or ID (clear-vm)")
     clear_host.add_argument("--dry-run", action="store_true")
 
     status = sub.add_parser("status", help="show live shaping state")
@@ -126,6 +130,8 @@ def _parser() -> argparse.ArgumentParser:
     clear.add_argument("--runtime", choices=("podman", "docker"))
     clear.add_argument("--iface")
     clear.add_argument("--dry-run", action="store_true")
+    clear.add_argument("--only-netns", type=int, help=argparse.SUPPRESS)   # used by timers
+    clear.add_argument("--only-pid", type=int, help=argparse.SUPPRESS)     # used by timers
     return parser
 
 
@@ -268,7 +274,7 @@ class _Commands:
             if not args.keep_going:
                 for target, backend, _, plan in reversed(done):
                     _rollback(target, backend, plan)
-                    timer.cancel(timer.unit_name("container", target.name))
+                    timer.cancel(_container_unit(target))
                 return EXIT_ERROR
         return _summary([p[0].name for p in done], failed)
 
@@ -359,6 +365,16 @@ class _Commands:
     def clear(args: argparse.Namespace) -> int:
         targets = [resolve(name, args.runtime, args.iface) for name in _names(args.container)]
         for target in targets:
+            only = getattr(args, "only_netns", None)
+            only_pid = getattr(args, "only_pid", None)
+            # The kernel can hand a restarted container the same namespace inode;
+            # its main PID changes, so both have to match.
+            if (only is not None and only != target.netns_inode) or (
+                    only_pid is not None and only_pid != target.pid):
+                # A --duration timer from before the container was restarted: its
+                # shaping went with the old namespace; leave the new one alone.
+                print(f"{target.name}: restarted since this timer was set; nothing to clear")
+                continue
             _clear_container(target, args)
         return 0
 
@@ -366,12 +382,16 @@ class _Commands:
 def _clear_container(target: Target, args: argparse.Namespace) -> None:
     """Clear one container target (any member of a shared namespace)."""
     backend = get_backend(target, "auto")
-    entry = _entry_for(load_state(), target) or {}
+    entry = _entry_for(load_state(), target)
     target.verify()
     live = inspect_live(backend, target.iface)
+    # With no state record (pruned, another user, a pre-0.4 file), a clsact that
+    # holds wanshape's own filter is taken to be wanshape's.
+    added_clsact = (bool(entry.get("added_clsact")) if entry and "added_clsact" in entry
+                    else live.our_filter)
+    entry = entry or {}
     plan = build_clear_plan(
-        target.iface, args.direction, live, bool(entry.get("added_clsact")),
-        entry.get("prior_root_qdisc"),
+        target.iface, args.direction, live, added_clsact, entry.get("prior_root_qdisc"),
     )
     if plan.empty:
         print(f"{target.name}: nothing to clear")
@@ -382,8 +402,19 @@ def _clear_container(target: Target, args: argparse.Namespace) -> None:
     for command in plan.commands:
         target.verify()
         backend.run(command)
-    timer.cancel(timer.unit_name("container", target.name))
+    left = inspect_live(backend, target.iface)
     entries = load_state()
+    if left.egress or left.ingress:
+        # Only one direction was cleared: keep the entry (and any timer) for the other.
+        entry = _entry_for(entries, target)
+        if entry is not None:
+            entry["direction"] = "egress" if left.egress else "ingress"
+            save_state(entries)
+        print(f"{target.name}: cleared {args.direction}; "
+              f"{'egress' if left.egress else 'ingress'} still shaped")
+        return
+    timer.cancel(_container_unit(target))
+    timer.cancel_legacy("container", target.name)
     for key in [k for k, e in entries.items()
                 if k == target.id or e.get("netns_inode") == target.netns_inode]:
         entries.pop(key)
@@ -396,7 +427,7 @@ def _apply_container(prep, args: argparse.Namespace, profile: Profile,
     """Apply one planned container target; False if it failed (and was handled)."""
     target, backend, live, plan = prep
     applied: list[str] = []
-    failure: tuple[str, CommandError] | None = None
+    failure: tuple[str, WanshapeError] | None = None
     for group in ("egress", "ingress"):
         if not getattr(plan, group):
             continue
@@ -404,7 +435,7 @@ def _apply_container(prep, args: argparse.Namespace, profile: Profile,
             for command in getattr(plan, group):
                 target.verify()
                 backend.run(command)
-        except CommandError as exc:
+        except WanshapeError as exc:   # a failed command, or the target went away
             failure = (group, exc)
             break
         applied.append(group)
@@ -418,14 +449,32 @@ def _apply_container(prep, args: argparse.Namespace, profile: Profile,
         else:
             _rollback(target, backend, plan)
         return False
-    unit = timer.unit_name("container", target.name)
-    if seconds:
-        timer.schedule(unit, seconds, ["clear", target.id, "--runtime", target.runtime])
-    else:
-        timer.cancel(unit)
+    # One timer per network namespace: shared by every member of a pod.
+    unit = _container_unit(target)
+    try:
+        for member in [target.name, *netns_members(target)]:   # pre-0.4 timers, any member
+            timer.cancel_legacy("container", member)
+        if seconds:
+            guard = ["--only-netns", str(target.netns_inode)]
+            if target.owns_netns:
+                # A pod member can restart (new PID) while the pod keeps its
+                # namespace and the shaping; only an owner's PID tells restarts apart.
+                guard += ["--only-pid", str(target.pid)]
+            timer.schedule(unit, seconds, ["clear", target.id, "--runtime", target.runtime,
+                                           "--iface", target.iface, *guard])
+        else:
+            timer.cancel(unit)
+    except WanshapeError as exc:
+        print(f"wanshape: {target.name}: {exc}", file=sys.stderr)
+        _rollback(target, backend, plan)
+        return False
     _save_and_report(target, profile.name, args.direction, live, plan,
                      until=timer.until(seconds) if seconds else None)
     return True
+
+
+def _container_unit(target: Target) -> str:
+    return timer.unit_name("container", f"netns{target.netns_inode}")
 
 
 def _names(values) -> list[str]:
@@ -468,28 +517,75 @@ def _run_host_plans(backend, plans, args: argparse.Namespace, profile: Profile,
     require_root()
     done, failed = [], []
     for name, plan in plans:
+        error: WanshapeError | None = None
+        cleaned = True
         try:
-            run_plan(backend, plan.commands, plan.rollback)
-        except CommandError as exc:
-            print(f"wanshape: {name}: failed and was rolled back: {exc}", file=sys.stderr)
+            # On failure run_plan itself undoes exactly what it created, and nothing
+            # that was there before.
+            run_plan(backend, plan.commands)
+        except WanshapeError as exc:
+            error = exc
+        else:
+            try:
+                _host_timer(plan.slot.kind, name, seconds)
+            except WanshapeError as exc:
+                # The shaping this run applied is complete but has no timer: take it
+                # off again (only this run's target exists under this name now).
+                error = exc
+                try:
+                    _undo_host_target(backend, name)
+                except WanshapeError as cleanup:
+                    cleaned = False
+                    print(f"wanshape: {name}: clean-up: {cleanup}", file=sys.stderr)
+        if error is not None:
+            if plan.slot.added_clsact:   # only a clsact wanshape added or co-owned
+                try:
+                    _tidy_clsact(backend, plan.slot.iface)
+                except WanshapeError as cleanup:
+                    cleaned = False
+                    print(f"wanshape: {name}: clean-up: {cleanup}", file=sys.stderr)
+            what = ("rolled back" if cleaned else
+                    "only partly rolled back; check `wanshape status`")
+            if plan.replaces:
+                what += "; its earlier shaping had already been removed, so it is now unshaped"
+            print(f"wanshape: {name}: failed and was {what}: {error}", file=sys.stderr)
             failed.append(name)
             if not args.keep_going:
                 for done_name, done_plan in reversed(done):
-                    live = inspect_host(backend)
-                    slot = live.by_name(done_name)
-                    if slot:
-                        for command in build_host_clear(slot, live):
-                            backend.run_result(command)
+                    try:
+                        _undo_host_target(backend, done_name)
+                    except WanshapeError as cleanup:
+                        # Still shaped: keep its timer so it is cleared in the end.
+                        print(f"wanshape: {done_name}: could not undo, still shaped: "
+                              f"{cleanup}", file=sys.stderr)
+                        continue
                     timer.cancel(timer.unit_name(done_plan.slot.kind, done_name))
                     print(f"wanshape: {done_name}: undone (use --keep-going to keep "
                           "the targets that worked)", file=sys.stderr)
                 return EXIT_ERROR
             continue
-        _host_timer(plan.slot.kind, name, seconds)
         print(f"{name}: applied {profile.name} to {args.direction} on {plan.slot.iface}"
               + (f" {plan.slot.describe()}" if plan.slot.describe() else ""))
         done.append((name, plan))
     return _summary([n for n, _ in done], failed)
+
+
+def _undo_host_target(backend, name: str) -> None:
+    live = inspect_host(backend)
+    slot = live.by_name(name)
+    if slot:
+        for command in build_host_clear(slot, live):
+            backend.run_result(command)
+
+
+def _tidy_clsact(backend, iface: str) -> None:
+    """Remove a clsact left with no filters and no wanshape target after a failure."""
+    live = inspect_host(backend, [iface])
+    state = live.iface(iface)
+    used = any(s.iface == iface for s in live.slots.values())
+    if state.exists and state.clsact and not used and not (
+            state.egress_prefs or state.ingress_prefs):
+        backend.run_result(["tc", "qdisc", "del", "dev", iface, "clsact"])
 
 
 def _apply_host(args: argparse.Namespace) -> int:
@@ -502,13 +598,21 @@ def _apply_host(args: argparse.Namespace) -> int:
             "label each container (wanshape.ports, wanshape.remote_ports)")
     backend = HostBackend()
     iface = resolve_host_iface(backend, args.iface, args.via or args.peer)
-    live = inspect_host(backend, [iface])
-    plans = []
-    for name in names:
+    looked_up = []
+    for name in names:   # container lookups first, outside the lock
         remote = (parse_ports(args.remote_ports) if args.remote_ports
                   else remote_ports_from_container(name, args.runtime))
         ports, source = host_ports_for(name, args.runtime, args.ports,
                                        optional=bool(remote or args.peer))
+        looked_up.append((name, remote, ports, source))
+    with host_lock() if not args.dry_run else contextlib.nullcontext():
+        return _plan_and_run_host(args, profile, seconds, backend, iface, looked_up)
+
+
+def _plan_and_run_host(args, profile, seconds, backend, iface, looked_up) -> int:
+    live = inspect_host(backend, [iface])
+    plans = []
+    for name, remote, ports, source in looked_up:
         plan = build_host_apply(name, profile, ports, iface, args.direction, live,
                                 remote_ports=remote, peer=args.peer,
                                 until=timer.until(seconds) if seconds else None)
@@ -529,14 +633,22 @@ def _apply_vm(args: argparse.Namespace) -> int:
     names = _names(args.domain)
     if len(names) > 1 and args.mac:
         raise WanshapeError("--mac picks one VM's interface: give one VM with it")
-    vms = [(name, resolve_vm(name, args.connect, args.mac)) for name in names]
+    vms = [(canonical_name(name, args.connect), resolve_vm(name, args.connect, args.mac))
+           for name in names]
     backend = HostBackend()
+    # virsh lookups are done above, outside the lock: the libvirt hook waits on
+    # this lock while libvirt holds the VM, and virsh would wait for libvirt.
+    with host_lock() if not args.dry_run else contextlib.nullcontext():
+        return _plan_and_run_vms(args, profile, seconds, backend, vms)
+
+
+def _plan_and_run_vms(args, profile, seconds, backend, vms) -> int:
     live = inspect_host(backend, [iface.device for _, iface in vms])
     plans = []
     for name, iface in vms:
         plan = build_host_apply(name, profile, [], iface.device, args.direction, live,
                                 kind="vm", until=timer.until(seconds) if seconds else None,
-                                device=device_kind(iface.type))
+                                device=device_kind(iface.type), mac=iface.mac)
         print(f"# VM: {name}, {iface.type} {iface.source}, MAC {iface.mac}")
         print(f"# host device {iface.device}, slot {plan.slot.slot}, {args.direction} "
               "(egress = from the VM)")
@@ -566,11 +678,16 @@ def _vm_hook(args: argparse.Namespace) -> int:
         xml_text = sys.stdin.read() if not sys.stdin.isatty() else ""
         backend = HostBackend()
 
-        def apply_fn(name, profile, direction, device, device_type="tap"):
+        def apply_fn(name, profile, direction, device, device_type="tap", mac=None):
             live = inspect_host(backend, [device])
             plan = build_host_apply(name, profile, [], device, direction, live, kind="vm",
-                                    device=device_type)
-            run_plan(backend, plan.commands, plan.rollback)
+                                    device=device_type, mac=mac)
+            try:
+                run_plan(backend, plan.commands)
+            except WanshapeError:
+                if plan.slot.added_clsact:   # e.g. one taken over from a stale slot
+                    _tidy_clsact(backend, device)
+                raise
 
         def release_fn(name):
             live = inspect_host(backend)
@@ -579,7 +696,13 @@ def _vm_hook(args: argparse.Namespace) -> int:
                 for command in build_host_clear(slot, live):
                     backend.run_result(command)
 
-        done = vmhook.run_hook(domain, operation, sub_operation, xml_text, apply_fn, release_fn)
+        acts = (operation, sub_operation) in (("started", "begin"), ("release", "end"))
+        if not acts or domain not in vmhook.load():
+            return 0   # nothing to do: don't wait for the lock at all
+        # Wait at most 30 s for a running wanshape command: never block a VM start.
+        with host_lock(timeout=30):
+            done = vmhook.run_hook(domain, operation, sub_operation, xml_text, apply_fn,
+                                   release_fn)
         if done != "not a wanshape VM":
             print(f"wanshape vm-hook: {domain} {operation} {sub_operation}: {done}",
                   file=sys.stderr)
@@ -615,6 +738,7 @@ def _duration(args: argparse.Namespace) -> int | None:
 
 def _host_timer(kind: str, name: str, seconds: int | None) -> None:
     unit = timer.unit_name(kind, name)
+    timer.cancel_legacy(kind, name)
     if seconds:
         timer.schedule(unit, seconds, ["clear-host", name])
         print(f"{name}: {timer.remaining(timer.until(seconds))}")
@@ -623,11 +747,21 @@ def _host_timer(kind: str, name: str, seconds: int | None) -> None:
 
 
 def _clear_host(args: argparse.Namespace) -> int:
-    backend = HostBackend()
-    live = inspect_host(backend)
     names = _names(args.name)
     if args.all == bool(names):
         raise WanshapeError("give target name(s) or --all")
+    if args.command == "clear-vm":
+        # VMs are recorded under their name: accept the UUID or ID apply-vm took.
+        # (virsh is asked here, before the lock; see _apply_vm.)
+        known = {s.name for s in inspect_host(HostBackend()).slots.values()} | set(vmhook.load())
+        names = [n if n in known else canonical_name(n, args.connect) for n in names]
+    with host_lock() if not args.dry_run else contextlib.nullcontext():
+        return _clear_host_locked(args, names)
+
+
+def _clear_host_locked(args: argparse.Namespace, names: list[str]) -> int:
+    backend = HostBackend()
+    live = inspect_host(backend)
     if args.all:
         slots = sorted(live.slots.values(), key=lambda x: x.slot)
     else:
@@ -659,6 +793,7 @@ def _clear_host(args: argparse.Namespace) -> int:
         require_root()
         run_plan(backend, commands)
         timer.cancel(timer.unit_name(slot.kind, slot.name))
+        timer.cancel_legacy(slot.kind, slot.name)
         label = "VM" if slot.kind == "vm" else "host-mode"
         print(f"{slot.name}: cleared {label} shaping on {slot.iface}")
         # Later slots must see this one gone (e.g. to decide on removing clsact).

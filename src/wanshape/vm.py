@@ -113,6 +113,17 @@ def check_tap_mac(device: str, guest_mac: str,
         )
 
 
+def canonical_name(domain: str, uri: str = DEFAULT_URI,
+                   virsh: Callable[..., str] | None = None) -> str:
+    """The VM's name, also when it was given by UUID or ID (records use the name)."""
+    virsh = virsh or _virsh
+    try:
+        name = virsh(uri, "domname", domain).strip()
+    except WanshapeError:
+        return domain   # resolve_vm reports the real problem
+    return name or domain
+
+
 def resolve_vm(domain: str, uri: str = DEFAULT_URI, mac: str | None = None,
                virsh: Callable[..., str] | None = None) -> VmInterface:
     virsh = virsh or _virsh

@@ -29,12 +29,17 @@ be read without root.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import ipaddress
 import json
 import os
 import re
+import stat
 import subprocess
+import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable, Sequence
 
 from .errors import (
@@ -54,7 +59,7 @@ ALIAS_PREFIX = "wanshape-host"
 PORTS_LABEL = "wanshape.ports"
 _PROTOCOLS = (("ip", "udp"), ("ip", "tcp"), ("ipv6", "udp"), ("ipv6", "tcp"))
 MAX_RANGES = PREFS_PER_SLOT // len(_PROTOCOLS)
-_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
+_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}")   # used with fullmatch
 _IFB = re.compile(r"^wsh(\d)(up|dn)$")
 _PREF = re.compile(r"\bpref\s+(\d+)\b")
 _DEV = re.compile(r"\bdev\s+(\S+)")
@@ -192,6 +197,7 @@ class HostSlot:
     peer: str | None = None  # only traffic with this address
     until: int | None = None  # epoch seconds when a --duration timer clears it
     device: str = "tap"  # VM mode: "tap" or "macvtap" (hooks the other way round)
+    mac: str | None = None  # VM mode: the guest's MAC, to spot a tap name reused by another VM
 
     @property
     def up(self) -> str:
@@ -213,6 +219,8 @@ class HostSlot:
             extra += f" until={self.until}"
         if self.kind == "vm" and self.device != "tap":
             extra += f" dev={self.device}"
+        if self.kind == "vm" and self.mac:
+            extra += f" mac={self.mac}"
         return (
             f"{ALIAS_PREFIX} name={self.name} kind={self.kind} profile={self.profile} "
             f"iface={self.iface} ports={ports} dir={self.direction} "
@@ -229,9 +237,14 @@ class HostSlot:
             parts.append(f"peer={self.peer}")
         return " ".join(parts)
 
-    def filters(self) -> list[tuple[str, list[str], str]]:
-        """(hook, match arguments, IFB) for each filter this target needs."""
-        result: list[tuple[str, list[str], str]] = []
+    def filters(self) -> list[tuple[str, list[str], str, bool]]:
+        """(hook, match arguments, IFB, remote) for each filter this target needs.
+
+        `remote` filters (remote ports, a peer on its own) get prefs in a band
+        above every local-port filter, so a packet from one target's local port
+        is always that target's, even if it also matches another's remote port.
+        """
+        result: list[tuple[str, list[str], str, bool]] = []
         if self.kind == "vm":
             # Tap: ingress = from the guest (up), egress = to the guest (down).
             # Macvtap: the other way round, like a container's own interface.
@@ -240,7 +253,7 @@ class HostSlot:
                      (("egress", "egress", self.up), ("ingress", "ingress", self.down)))
             for want, hook, ifb in hooks:
                 if self.direction in (want, "both"):
-                    result.append((hook, ["protocol", "all", "matchall"], ifb))
+                    result.append((hook, ["protocol", "all", "matchall"], ifb, False))
             return result
         families = ("ip", "ipv6")
         if self.peer:
@@ -253,21 +266,29 @@ class HostSlot:
             if self.direction not in (hook, "both"):
                 continue
             peer = [ip_key, self.peer] if self.peer else []
-            matches = ([(local_key, r) for r in self.ports]
-                       + [(remote_key, r) for r in self.remote_ports])
+            matches = ([(local_key, r, False) for r in self.ports]
+                       + [(remote_key, r, True) for r in self.remote_ports])
             for proto in families:
                 if not matches:  # peer only: everything with that host
-                    result.append((hook, ["protocol", proto, "flower", *peer], ifb))
-                for key, r in matches:
+                    result.append((hook, ["protocol", proto, "flower", *peer], ifb, True))
+                for key, r, remote in matches:
                     for ip_proto in ("udp", "tcp"):
                         result.append((hook, ["protocol", proto, "flower", "ip_proto",
-                                              ip_proto, *peer, key, str(r)], ifb))
+                                              ip_proto, *peer, key, str(r)], ifb, remote))
         return result
 
 
-def slot_prefs(slot: int) -> range:
-    start = PREF_BASE + slot * PREFS_PER_SLOT
+REMOTE_PREF_BASE = PREF_BASE + MAX_SLOTS * PREFS_PER_SLOT   # 50300
+
+
+def slot_prefs(slot: int, remote: bool = False) -> range:
+    """A slot's prefs: local-port (and VM) filters, or the remote band above them all."""
+    start = (REMOTE_PREF_BASE if remote else PREF_BASE) + slot * PREFS_PER_SLOT
     return range(start, start + PREFS_PER_SLOT)
+
+
+def all_slot_prefs(slot: int) -> set[int]:
+    return set(slot_prefs(slot)) | set(slot_prefs(slot, remote=True))
 
 
 def parse_alias(slot: int, alias: str) -> HostSlot | None:
@@ -292,6 +313,7 @@ def parse_alias(slot: int, alias: str) -> HostSlot | None:
             peer=fields.get("peer"),
             until=int(fields["until"]) if fields.get("until", "").isdigit() else None,
             device=fields.get("dev", "tap"),
+            mac=fields.get("mac"),
         )
     except (KeyError, WanshapeError):
         return None
@@ -309,7 +331,7 @@ class IfaceState:
         return self.egress_prefs if hook == "egress" else self.ingress_prefs
 
     def foreign_filters(self) -> bool:
-        ours = range(PREF_BASE, PREF_BASE + MAX_SLOTS * PREFS_PER_SLOT)
+        ours = range(PREF_BASE, REMOTE_PREF_BASE + MAX_SLOTS * PREFS_PER_SLOT)
         return any(p not in ours for p in self.egress_prefs | self.ingress_prefs)
 
 
@@ -391,7 +413,7 @@ def resolve_host_iface(backend, iface: str | None = None, via: str | None = None
 class HostPlan:
     slot: HostSlot
     commands: list[Command] = field(default_factory=list)
-    rollback: list[Command] = field(default_factory=list)
+    replaces: bool = False   # the plan first removes earlier shaping (re-apply, takeover)
 
 
 def build_host_apply(
@@ -406,6 +428,7 @@ def build_host_apply(
     peer: str | None = None,
     until: int | None = None,
     device: str = "tap",
+    mac: str | None = None,
 ) -> HostPlan:
     """Plan a ports target, or with kind="vm" (and no ports) a whole tap device."""
     remote_ports = list(remote_ports or [])
@@ -416,7 +439,7 @@ def build_host_apply(
             raise WanshapeError(f"invalid peer address {peer!r}") from exc
     if direction not in ("egress", "ingress", "both"):
         raise WanshapeError(f"invalid direction {direction!r}")
-    if not _NAME.match(name):
+    if not _NAME.fullmatch(name):
         raise WanshapeError(f"invalid target name {name!r}")
     if kind == "vm" and ports:
         raise WanshapeError("a VM target shapes the whole device; it takes no ports")
@@ -430,19 +453,38 @@ def build_host_apply(
         raise ConflictError(
             f"{name!r} is already a {existing.kind} target; clear it first"
         )
+    # Another VM's slot on this device is stale: resolve_vm checked that the
+    # device now carries this VM's MAC. Slots from before v0.4 record no MAC.
+    stale_here = [o for o in live.slots.values()
+                  if o is not existing and o.iface == iface and o.kind == "vm" and kind == "vm"
+                  and mac and (not o.mac or o.mac != mac.lower())]
     for other in live.slots.values():
-        if other is existing or other.iface != iface:
+        if other is existing or other.iface != iface or other in stale_here:
             continue
         if kind == "vm" or other.kind == "vm":
             raise ConflictError(
                 f"{iface} is already shaped for {other.name!r}; "
                 f"clear it first with `wanshape clear-host {other.name}`"
             )
-        clash = [f"{a}/{b}" for a in ports for b in other.ports if a.overlaps(b)]
+        clash: list[str] = []
         if not peer or not other.peer or peer == other.peer:
+            # Different peers can never match the same packet. Otherwise refuse the
+            # ambiguous pairs: overlapping local ports, overlapping remote ports, or
+            # a peer-only target against another remote-side one. A packet from one
+            # target's local port to another's remote port is the first target's:
+            # local-port filters have prefs below every remote one.
+            clash += [f"{a}/{b}" for a in ports for b in other.ports if a.overlaps(b)]
             clash += [f"remote {a}/{b}" for a in remote_ports for b in other.remote_ports
                       if a.overlaps(b)]
-            if (not ports and not remote_ports) or (not other.ports and not other.remote_ports):
+            peer_only = not ports and not remote_ports
+            other_peer_only = not other.ports and not other.remote_ports
+            # A target applied before v0.4 has its remote-side filters in the local
+            # band, so the precedence above doesn't hold for it: keep refusing.
+            if ports and (other.remote_ports or other_peer_only) and _legacy_band(
+                    other, live.iface(iface)):
+                clash += [f"{other.name} was applied by an older wanshape; re-apply it first"]
+            if (peer_only and (other.remote_ports or other_peer_only)) or (
+                    other_peer_only and (remote_ports or peer_only)):
                 clash += [f"peer {peer or 'any'}/{other.peer or 'any'}"]
         if clash:
             raise ConflictError(
@@ -451,6 +493,14 @@ def build_host_apply(
             )
 
     commands: list[Command] = []
+    inherited_clsact = False
+    for old in stale_here:
+        # A VM that was shaped on this device name has gone, and libvirt gave the
+        # name to this VM: its leftover filters and IFBs are cleared first, and
+        # if wanshape added the clsact, the new slot takes over that record.
+        commands += build_host_clear(old, live, keep_clsact=True)
+        inherited_clsact = inherited_clsact or old.added_clsact
+        live.slots.pop(old.slot, None)
     state = live.iface(iface)
     if state.ingress_qdisc and not state.clsact:
         raise ConflictError(
@@ -466,11 +516,14 @@ def build_host_apply(
         commands += build_host_clear(existing, live, keep_clsact=same_iface)
         slot_no = existing.slot
         added_clsact = existing.added_clsact if same_iface else False
+    elif stale_here:
+        slot_no = stale_here[0].slot   # take over the stale VM's slot, not a new one
+        added_clsact = False
     else:
         slot_no = _free_slot(live, iface)
         added_clsact = False
 
-    if not clsact_present:
+    if not clsact_present or inherited_clsact:
         added_clsact = True
     elif any(s.added_clsact for s in live.slots.values()
              if s.iface == iface and s is not existing):
@@ -481,11 +534,15 @@ def build_host_apply(
         slot=slot_no, name=name, profile=profile.name, iface=iface,
         ports=list(ports), direction=direction, added_clsact=added_clsact, kind=kind,
         remote_ports=remote_ports, peer=peer, until=until, device=device,
+        mac=mac.lower() if mac else None,
     )
-    if len(slot.filters()) > PREFS_PER_SLOT:
-        raise WanshapeError(
-            f"too many port ranges: they need {len(slot.filters())} filters, at most "
-            f"{PREFS_PER_SLOT} per target")
+    for remote in (False, True):
+        count = max((sum(1 for f in slot.filters() if f[0] == hook and f[3] == remote)
+                     for hook in ("egress", "ingress")), default=0)
+        if count > PREFS_PER_SLOT:
+            raise WanshapeError(
+                f"too many port ranges: they need {count} filters, at most "
+                f"{PREFS_PER_SLOT} per target")
     alias = slot.alias()
     if len(alias.encode()) > 255:
         raise WanshapeError("too many port ranges to record; merge some of them")
@@ -500,22 +557,22 @@ def build_host_apply(
     fresh.append(["ip", "link", "set", "dev", slot.up, "alias", alias])
     if not clsact_present:
         fresh.append(["tc", "qdisc", "add", "dev", iface, "clsact"])
-    prefs = {"egress": iter(slot_prefs(slot.slot)), "ingress": iter(slot_prefs(slot.slot))}
-    used: dict[str, list[int]] = {"egress": [], "ingress": []}
-    for hook, match, ifb in slot.filters():
-        pref = next(prefs[hook])
-        used[hook].append(pref)
+    prefs = {(hook, remote): iter(slot_prefs(slot.slot, remote))
+             for hook in ("egress", "ingress") for remote in (False, True)}
+    for hook, match, ifb, remote in slot.filters():
+        pref = next(prefs[(hook, remote)])
         fresh.append(["tc", "filter", "add", "dev", iface, hook, "pref", str(pref),
                       *match, "action", "mirred", "egress", "redirect", "dev", ifb])
 
-    rollback: list[Command] = []
-    for hook in ("egress", "ingress"):
-        for pref in used[hook]:
-            rollback.append(["tc", "filter", "del", "dev", iface, hook, "pref", str(pref)])
-    rollback += [["ip", "link", "del", slot.up], ["ip", "link", "del", slot.down]]
-    if not clsact_present:
-        rollback.append(["tc", "qdisc", "del", "dev", iface, "clsact"])
-    return HostPlan(slot=slot, commands=commands + fresh, rollback=rollback)
+    return HostPlan(slot=slot, commands=commands + fresh,
+                    replaces=bool(existing or stale_here))
+
+
+def _legacy_band(slot: HostSlot, state: IfaceState) -> bool:
+    """True when a ports target's remote-side filters are still in the local band."""
+    prefs = state.egress_prefs | state.ingress_prefs
+    return (slot.kind == "ports" and bool(prefs & set(slot_prefs(slot.slot)))
+            and not prefs & set(slot_prefs(slot.slot, remote=True)))
 
 
 def _free_slot(live: HostLive, iface: str) -> int:
@@ -524,7 +581,7 @@ def _free_slot(live: HostLive, iface: str) -> int:
     for slot in range(MAX_SLOTS):
         if slot in live.slots or {f"wsh{slot}up", f"wsh{slot}dn"} & live.ifbs:
             continue
-        if used_prefs & set(slot_prefs(slot)):
+        if used_prefs & all_slot_prefs(slot):
             continue
         return slot
     raise ConflictError(
@@ -532,15 +589,31 @@ def _free_slot(live: HostLive, iface: str) -> int:
     )
 
 
+def slot_filter_prefs(slot: HostSlot) -> dict[str, set[int]]:
+    """The prefs this slot's filters occupy, per hook: in the current layout
+    (remote-side filters in the upper band) and in the pre-0.4 one (all filters
+    in the local band), so a clear removes exactly its own filters, never
+    another tool's that happen to sit in the same range."""
+    used: dict[str, set[int]] = {"egress": set(), "ingress": set()}
+    current = {(h, r): iter(slot_prefs(slot.slot, r))
+               for h in ("egress", "ingress") for r in (False, True)}
+    legacy = {h: iter(slot_prefs(slot.slot)) for h in ("egress", "ingress")}
+    for hook, _match, _ifb, remote in slot.filters():
+        used[hook].add(next(current[(hook, remote)]))
+        used[hook].add(next(legacy[hook]))
+    return used
+
+
 def build_host_clear(slot: HostSlot, live: HostLive, keep_clsact: bool = False) -> list[Command]:
     state = live.iface(slot.iface)
     commands: list[Command] = []
-    ours = set(slot_prefs(slot.slot))
+    own = slot_filter_prefs(slot)
+    ours = own["egress"] | own["ingress"]
     if not state.exists:
         # The device is gone (and its filters with it): only our IFBs remain.
         return [["ip", "link", "del", dev] for dev in (slot.up, slot.down) if dev in live.ifbs]
     for hook in ("egress", "ingress"):
-        for pref in sorted(state.prefs(hook) & ours):
+        for pref in sorted(state.prefs(hook) & own[hook]):
             commands.append(["tc", "filter", "del", "dev", slot.iface, hook, "pref", str(pref)])
     for dev in (slot.up, slot.down):
         if dev in live.ifbs:
@@ -559,15 +632,76 @@ def build_host_clear(slot: HostSlot, live: HostLive, keep_clsact: bool = False) 
 # ----------------------------------------------------------------- execution
 
 
-def run_plan(backend, commands: Sequence[Command], rollback: Sequence[Command] = ()) -> None:
-    """Run commands in order; on failure undo with `rollback` (best effort) and re-raise."""
+def _undo(command: Command) -> Command | None:
+    """The command that removes what `command` created, if it created something."""
+    if command[:3] == ["ip", "link", "add"]:
+        return ["ip", "link", "del", command[3]]
+    if command[:3] == ["tc", "filter", "add"]:
+        return ["tc", "filter", "del", *command[3:8]]      # dev D HOOK pref P
+    if command[:3] == ["tc", "qdisc", "add"] and command[-1] == "clsact":
+        return ["tc", "qdisc", "del", "dev", command[4], "clsact"]
+    return None   # qdiscs on our own IFBs go with the IFB
+
+
+def run_plan(backend, commands: Sequence[Command]) -> None:
+    """Run commands in order; on failure undo what *this run* created, and re-raise.
+
+    Only the commands that succeeded are undone, in reverse order: if `ip link
+    add wsh0up` fails because the device exists (another run took the slot),
+    that device isn't ours and is left alone.
+    """
+    done: list[Command] = []
     for command in commands:
         try:
             backend.run(command)
-        except CommandError:
-            for undo in rollback:
+        except WanshapeError:
+            for undo in filter(None, map(_undo, reversed(done))):
                 backend.run_result(undo)
             raise
+        done.append(command)
+
+
+LOCK_DIR = Path("/run/wanshape")   # fixed: every root run must agree on it
+
+
+@contextlib.contextmanager
+def host_lock(timeout: float | None = None):
+    """Serialise host and VM changes (two applies would otherwise pick one slot).
+
+    The lock lives in a directory only root can write (/run/wanshape, 0700),
+    opened without following symlinks, so another local user can neither hold
+    it nor switch it off. Without root nothing is locked: such a run is refused
+    by require_root() before it changes anything. With `timeout` (the libvirt
+    hook), waiting longer raises instead of blocking a VM start.
+    """
+    if os.geteuid() != 0:
+        yield
+        return
+    try:
+        LOCK_DIR.mkdir(mode=0o700, exist_ok=True)
+        info = os.lstat(LOCK_DIR)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            raise WanshapeError(f"{LOCK_DIR} must be a root-owned directory others can't write")
+        fd = os.open(LOCK_DIR / "lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError as exc:
+        raise PrerequisiteError(f"cannot take the wanshape lock in {LOCK_DIR}: {exc}") from exc
+    try:
+        if timeout is None:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        else:
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise WanshapeError(
+                            f"another wanshape run held the lock for {timeout:.0f} s") from None
+                    time.sleep(0.2)
+        yield
+    finally:
+        os.close(fd)   # releases the lock
 
 
 # --------------------------------------------------------------- containers
