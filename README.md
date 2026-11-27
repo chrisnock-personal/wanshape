@@ -35,6 +35,8 @@ sudo "$(command -v wanshape)" apply-host ...     # host and VM modes need root
 
 `sudo` resets `PATH`, so give it the full path as above; a pipx install keeps working under sudo because its environment doesn't depend on your home directory. (A `pip install --user` copy doesn't: under sudo it can't find its own package.)
 
+Packaging and the release workflow exist, but wanshape is not on PyPI yet; [docs/RELEASING.md](docs/RELEASING.md) is the publication checklist. Keep the git URL above until a PyPI install has been verified.
+
 Or run it straight from a checkout, no install: `./bin/wanshape ...` and `sudo ./bin/wanshape ...`.
 
 ## Profiles
